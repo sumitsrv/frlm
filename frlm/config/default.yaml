@@ -1,0 +1,453 @@
+# =============================================================================
+# FRLM - Factual Retrieval Language Model
+# Master Configuration File
+#
+# Every hyperparameter, path, and magic number in the project is defined here.
+# Environment variables override sensitive values (see config.py).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Project metadata
+# -----------------------------------------------------------------------------
+project:
+  name: "frlm"
+  version: "0.1.0"
+  description: "Factual Retrieval Language Model for biomedical oncology pharmacology"
+  seed: 42
+  deterministic: true
+
+# -----------------------------------------------------------------------------
+# Paths — all relative to project root unless absolute
+# -----------------------------------------------------------------------------
+paths:
+  project_root: "."
+  data_dir: "data"
+  corpus_dir: "data/corpus"
+  processed_dir: "data/processed"
+  kg_dir: "data/kg"
+  labels_dir: "data/labels"
+  checkpoints_dir: "checkpoints"
+  logs_dir: "logs"
+  cache_dir: "cache"
+  faiss_index_dir: "data/faiss_indices"
+  export_dir: "exports"
+
+# -----------------------------------------------------------------------------
+# Backbone model — BioMedLM 2.7B
+# -----------------------------------------------------------------------------
+model:
+  backbone:
+    name: "stanford-crfm/BioMedLM"
+    hidden_dim: 2560
+    num_layers: 32
+    num_heads: 32
+    vocab_size: 50257
+    max_seq_length: 1024
+    dtype: "float16"
+    gradient_checkpointing: true
+    freeze_backbone: false
+    freeze_layers: 0  # number of bottom layers to freeze (0 = none)
+
+  # Router head — classifies each step as retrieval or generation
+  router_head:
+    input_dim: 2560   # must match backbone hidden_dim
+    hidden_dim: 256
+    output_dim: 1
+    activation: "relu"
+    dropout: 0.1
+    threshold: 0.5     # sigmoid threshold for retrieval vs generation
+
+  # Retrieval head — three sub-heads
+  retrieval_head:
+    semantic:
+      input_dim: 2560
+      output_dim: 768   # SapBERT embedding dimension
+      normalize: true    # L2 normalization
+    granularity:
+      input_dim: 2560
+      num_levels: 4      # atomic=0, relation=1, entity=2, cluster=3
+      level_names:
+        - "atomic"       # Level 0: single triple
+        - "relation"     # Level 1: all relations between two entities
+        - "entity"       # Level 2: all facts about one entity
+        - "cluster"      # Level 3: curated subgraph
+    temporal:
+      input_dim: 2560
+      num_modes: 3
+      mode_names:
+        - "CURRENT"        # valid_to IS NULL
+        - "AT_TIMESTAMP"   # valid_from <= t < valid_to
+        - "HISTORY"        # all versions in chain
+
+  # Generation head — standard LM head
+  generation_head:
+    input_dim: 2560
+    output_dim: 50257   # must match backbone vocab_size
+    tie_weights: true    # tie with backbone input embeddings
+
+# -----------------------------------------------------------------------------
+# Frozen encoder — SapBERT for KG fact embeddings
+# -----------------------------------------------------------------------------
+sapbert:
+  model_name: "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+  embedding_dim: 768
+  max_length: 64
+  batch_size: 256
+  device: "cuda"
+  dtype: "float16"
+  pool_strategy: "cls"  # cls, mean, max
+
+# -----------------------------------------------------------------------------
+# Knowledge Graph — Neo4j
+# -----------------------------------------------------------------------------
+neo4j:
+  uri: "bolt://localhost:7687"
+  username: "neo4j"
+  password: "CHANGE_ME"          # override with FRLM_NEO4J_PASSWORD env var
+  database: "frlm"
+  max_connection_pool_size: 50
+  connection_timeout: 30         # seconds
+  max_transaction_retry_time: 30 # seconds
+  encrypted: false
+  trust: "TRUST_ALL_CERTIFICATES"
+
+  # Schema configuration
+  graph_schema:
+    fact_label: "Fact"
+    entity_label: "Entity"
+    relation_type: "HAS_FACT"
+    version_chain_type: "SUPERSEDES"
+    hash_algorithm: "sha256"      # SHA-256(subject_id || relation || object_id || valid_from)
+    hash_separator: "||"
+
+  # Batch operation settings
+  batch:
+    import_batch_size: 5000
+    query_batch_size: 1000
+    max_retries: 3
+    retry_delay: 1.0              # seconds
+
+# -----------------------------------------------------------------------------
+# FAISS — vector index
+# -----------------------------------------------------------------------------
+faiss:
+  index_type: "IVF4096,PQ64"     # IVF with 4096 centroids, PQ with 64 sub-quantizers
+  metric: "L2"                    # L2 or IP (inner product)
+  embedding_dim: 768              # must match SapBERT output
+  nprobe: 64                      # number of clusters to visit at search time
+  nlist: 4096                     # number of Voronoi cells for IVF
+  pq_m: 64                       # number of sub-quantizers for PQ
+  pq_nbits: 8                    # bits per sub-quantizer
+  use_gpu: true
+  gpu_id: 0
+  train_sample_size: 500000       # number of vectors for training the index
+  search_k: 100                   # number of results to retrieve
+  use_precomputed_table: true     # precompute PQ distance tables on GPU
+
+  # Hierarchical index levels
+  hierarchical:
+    level_0: "atomic"              # single triple
+    level_1: "relation"            # all relations between entity pair
+    level_2: "entity"              # all facts about one entity
+    level_3: "cluster"             # curated subgraph
+    default_level: 0
+
+  # Hard negative mining
+  hard_negatives:
+    num_hard_negatives: 15         # per positive
+    num_random_negatives: 5        # per positive
+    mine_frequency: 1000           # re-mine every N steps
+    similarity_range:              # cosine similarity range for hard negatives
+      min: 0.3
+      max: 0.8
+
+# -----------------------------------------------------------------------------
+# Entity extraction — SciSpacy
+# -----------------------------------------------------------------------------
+extraction:
+  entity:
+    spacy_model: "en_core_sci_lg"
+    linker: "umls"                  # UMLS concept linking
+    resolve_abbreviations: true
+    min_entity_length: 2
+    max_entity_length: 100
+    confidence_threshold: 0.7
+    batch_size: 128
+    n_process: 4                    # parallel processing
+
+  # Relation extraction — Claude API
+  relation:
+    model: "claude-sonnet-4-5-20250929"
+    api_key: "CHANGE_ME"            # override with ANTHROPIC_API_KEY env var
+    max_tokens: 4096
+    temperature: 0.0
+    batch_size: 10                  # sentences per API call
+    max_retries: 3
+    retry_delay: 2.0
+    rate_limit_rpm: 50              # requests per minute
+    rate_limit_tpm: 100000          # tokens per minute
+    system_prompt: |
+      You are a biomedical relation extraction system specialized in oncology pharmacology.
+      Extract structured relations from the provided text as JSON.
+      Each relation must have: subject, relation_type, object, confidence, evidence_span.
+      Valid relation types: TREATS, CAUSES, INHIBITS, ACTIVATES, ASSOCIATED_WITH,
+      METABOLIZED_BY, CONTRAINDICATED_WITH, DOSAGE_OF, BIOMARKER_FOR, RESISTANCE_TO.
+
+  # Corpus loading
+  corpus:
+    source: "pmc_oa"                # PubMed Central Open Access
+    format: "xml"
+    max_documents: null              # null = no limit
+    filter_journals: []              # empty = all journals
+    min_year: 2000
+    max_year: null
+    sections:                        # which paper sections to extract
+      - "abstract"
+      - "introduction"
+      - "methods"
+      - "results"
+      - "discussion"
+    chunk_size: 512                  # tokens per chunk
+    chunk_overlap: 64                # token overlap between chunks
+
+# -----------------------------------------------------------------------------
+# Labeling — Claude API for router training labels
+# -----------------------------------------------------------------------------
+labeling:
+  model: "claude-sonnet-4-5-20250929"
+  api_key: "CHANGE_ME"              # override with ANTHROPIC_API_KEY env var
+  max_tokens: 4096
+  temperature: 0.0
+  batch_size: 5                     # chunks per API call
+  max_retries: 3
+  retry_delay: 2.0
+  rate_limit_rpm: 50
+  inter_annotator_samples: 200      # samples for IAA measurement
+  min_agreement_threshold: 0.8      # Cohen's kappa minimum
+  system_prompt: |
+    You are annotating biomedical text for a factual retrieval language model.
+    For each token span, classify it as:
+    - RETRIEVAL: factual claims that can be verified against a knowledge base
+      (drug names, dosages, mechanisms, clinical outcomes, biomarker associations)
+    - GENERATION: linguistic glue, reasoning, discourse markers, syntactic structure
+    Output JSON with character offsets for each labeled span.
+
+  # Label quality
+  validation:
+    min_retrieval_ratio: 0.15       # minimum fraction of tokens labeled retrieval
+    max_retrieval_ratio: 0.70       # maximum fraction of tokens labeled retrieval
+    min_spans_per_chunk: 1
+    max_spans_per_chunk: 50
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  # Global settings
+  output_dir: "checkpoints"
+  seed: 42
+  fp16: true
+  bf16: false
+  gradient_accumulation_steps: 8
+  max_grad_norm: 1.0
+  dataloader_num_workers: 4
+  pin_memory: true
+  log_every_n_steps: 10
+  eval_every_n_steps: 500
+  save_every_n_steps: 1000
+  max_checkpoints: 5                # keep last N checkpoints
+
+  # Phase 1: Router pre-training
+  router:
+    epochs: 10
+    batch_size: 32
+    learning_rate: 5.0e-5
+    weight_decay: 0.01
+    warmup_ratio: 0.1
+    scheduler: "cosine"             # linear, cosine, cosine_with_restarts
+    label_smoothing: 0.05
+    pos_weight: 1.5                 # class weight for positive (retrieval) class
+    early_stopping_patience: 3
+    early_stopping_metric: "f1"
+    freeze_backbone: true           # freeze backbone during router training
+
+  # Phase 2: Retrieval head training
+  retrieval:
+    epochs: 20
+    batch_size: 16
+    learning_rate: 2.0e-5
+    weight_decay: 0.01
+    warmup_ratio: 0.1
+    scheduler: "cosine"
+    contrastive_temperature: 0.07   # InfoNCE temperature tau
+    margin: 0.2                     # triplet margin (unused in InfoNCE, kept for experimentation)
+    early_stopping_patience: 5
+    early_stopping_metric: "precision_at_1"
+    freeze_backbone: false
+    freeze_router: true             # freeze router during retrieval training
+
+  # Phase 3: Joint fine-tuning
+  joint:
+    epochs: 15
+    batch_size: 8
+    learning_rate: 1.0e-5
+    weight_decay: 0.01
+    warmup_ratio: 0.05
+    scheduler: "cosine_with_restarts"
+    num_cycles: 3                   # for cosine_with_restarts
+    early_stopping_patience: 5
+    early_stopping_metric: "combined_loss"
+    freeze_backbone: false
+    freeze_router: false
+    freeze_retrieval: false
+
+  # Data splits
+  splits:
+    train: 0.8
+    validation: 0.1
+    test: 0.1
+    stratify_by: "retrieval_ratio"  # stratify by ratio of retrieval tokens
+
+# -----------------------------------------------------------------------------
+# Loss function weights
+# -----------------------------------------------------------------------------
+loss:
+  router_weight: 1.0               # L_router coefficient
+  retrieval_weight: 2.0            # L_retrieval coefficient (InfoNCE)
+  generation_weight: 1.0           # L_generation coefficient (cross-entropy)
+  contrastive_temperature: 0.07    # InfoNCE temperature tau
+
+# -----------------------------------------------------------------------------
+# DeepSpeed configuration
+# -----------------------------------------------------------------------------
+deepspeed:
+  enabled: true
+  config:
+    train_batch_size: "auto"
+    train_micro_batch_size_per_gpu: "auto"
+    gradient_accumulation_steps: "auto"
+    gradient_clipping: 1.0
+    fp16:
+      enabled: true
+      loss_scale: 0
+      loss_scale_window: 1000
+      initial_scale_power: 16
+      hysteresis: 2
+      min_loss_scale: 1
+    zero_optimization:
+      stage: 2
+      offload_optimizer:
+        device: "cpu"
+        pin_memory: true
+      offload_param:
+        device: "none"
+      overlap_comm: true
+      contiguous_gradients: true
+      reduce_bucket_size: 5.0e+8
+      allgather_bucket_size: 5.0e+8
+    optimizer:
+      type: "AdamW"
+      params:
+        lr: "auto"
+        betas: [0.9, 0.999]
+        eps: 1.0e-8
+        weight_decay: "auto"
+    scheduler:
+      type: "WarmupDecayLR"
+      params:
+        warmup_min_lr: 0
+        warmup_max_lr: "auto"
+        warmup_num_steps: "auto"
+        total_num_steps: "auto"
+    activation_checkpointing:
+      partition_activations: true
+      cpu_checkpointing: false
+      contiguous_memory_optimization: false
+      number_checkpoints: null
+      synchronize_checkpoint_boundary: false
+      profile: false
+
+# -----------------------------------------------------------------------------
+# Weights & Biases logging
+# -----------------------------------------------------------------------------
+wandb:
+  enabled: true
+  project: "frlm"
+  entity: null                      # W&B team/user name
+  run_name: null                    # auto-generated if null
+  tags:
+    - "biomedical"
+    - "oncology"
+    - "retrieval-augmented"
+  log_model: true
+  log_frequency: 10                 # steps between W&B logs
+  watch_model: false                # watch gradients (expensive)
+  api_key: "CHANGE_ME"             # override with WANDB_API_KEY env var
+
+# -----------------------------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------------------------
+evaluation:
+  retrieval:
+    k_values: [1, 5, 10, 20]       # P@k values to compute
+    temporal_accuracy: true          # evaluate temporal resolution
+    granularity_accuracy: true       # evaluate granularity prediction
+    num_eval_samples: 5000
+  generation:
+    max_length: 256
+    temperature: 1.0
+    top_k: 50
+    top_p: 0.95
+    num_eval_samples: 1000
+    compute_perplexity: true
+    compute_bleu: false              # not primary metric for this task
+    compute_rouge: false
+  router:
+    threshold_sweep: [0.3, 0.4, 0.5, 0.6, 0.7]  # sweep sigmoid thresholds
+    compute_confusion_matrix: true
+    compute_calibration: true
+    num_eval_samples: 5000
+  end_to_end:
+    num_eval_samples: 500
+    compute_factual_accuracy: true
+    compute_temporal_consistency: true
+
+# -----------------------------------------------------------------------------
+# Inference / Serving
+# -----------------------------------------------------------------------------
+inference:
+  device: "cuda"
+  dtype: "float16"
+  max_length: 512
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.95
+  do_sample: true
+  num_beams: 1
+  repetition_penalty: 1.1
+  router_threshold: 0.5
+  batch_size: 1
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  reload: false
+  log_level: "info"
+  cors_origins:
+    - "*"
+  max_concurrent_requests: 16
+  request_timeout: 60               # seconds
+  model_warmup: true                # run a warmup inference on startup
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"                     # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s | %(name)-30s | %(levelname)-8s | %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+  file: "logs/frlm.log"
+  max_bytes: 10485760               # 10 MB
+  backup_count: 5
+  console: true

@@ -1,0 +1,185 @@
+# =============================================================================
+# FRLM - Factual Retrieval Language Model
+# Makefile for common operations
+# =============================================================================
+
+PYTHON      ?= python
+PIP         ?= pip
+PYTEST      ?= pytest
+CONFIG      ?= config/default.yaml
+SHELL       := /bin/bash
+.DEFAULT_GOAL := help
+
+# ---------------------------------------------------------------------------
+# Environment setup
+# ---------------------------------------------------------------------------
+
+.PHONY: setup
+setup: ## Install all dependencies and the package in editable mode
+	$(PIP) install --upgrade pip setuptools wheel
+	$(PIP) install -r requirements.txt
+	$(PIP) install -e ".[dev,notebook]"
+	$(PYTHON) -m spacy download en_core_sci_lg || true
+	@echo "Setup complete."
+
+.PHONY: setup-gpu
+setup-gpu: ## Install with GPU-specific dependencies (CUDA 11.8)
+	$(PIP) install --upgrade pip setuptools wheel
+	$(PIP) install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+	$(PIP) install -r requirements.txt
+	$(PIP) install -e ".[dev,notebook]"
+	@echo "GPU setup complete."
+
+# ---------------------------------------------------------------------------
+# Data pipeline
+# ---------------------------------------------------------------------------
+
+.PHONY: download-corpus
+download-corpus: ## Download PMC Open Access corpus
+	$(PYTHON) scripts/01_download_corpus.py --config $(CONFIG)
+
+.PHONY: extract-entities
+extract-entities: ## Extract biomedical entities with SciSpacy
+	$(PYTHON) scripts/02_extract_entities.py --config $(CONFIG)
+
+.PHONY: extract-relations
+extract-relations: ## Extract relations with Claude API
+	$(PYTHON) scripts/03_extract_relations.py --config $(CONFIG)
+
+.PHONY: build-kg
+build-kg: ## Populate Neo4j knowledge graph
+	$(PYTHON) scripts/04_populate_kg.py --config $(CONFIG)
+
+.PHONY: build-index
+build-index: ## Build FAISS vector index over KG embeddings
+	$(PYTHON) scripts/05_build_faiss_index.py --config $(CONFIG)
+
+.PHONY: label-data
+label-data: ## Generate router training labels with Claude API
+	$(PYTHON) scripts/06_generate_router_labels.py --config $(CONFIG)
+
+.PHONY: data-pipeline
+data-pipeline: download-corpus extract-entities extract-relations build-kg build-index label-data ## Run full data pipeline end-to-end
+	@echo "Data pipeline complete."
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+
+.PHONY: train-router
+train-router: ## Phase 1: Train router head
+	$(PYTHON) scripts/07_train_router.py --config $(CONFIG)
+
+.PHONY: train-retrieval
+train-retrieval: ## Phase 2: Train retrieval head
+	$(PYTHON) scripts/08_train_retrieval.py --config $(CONFIG)
+
+.PHONY: train-joint
+train-joint: ## Phase 3: Joint fine-tuning
+	$(PYTHON) scripts/09_train_joint.py --config $(CONFIG)
+
+.PHONY: train-all
+train-all: train-router train-retrieval train-joint ## Run all three training phases sequentially
+	@echo "All training phases complete."
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+.PHONY: evaluate
+evaluate: ## Run full evaluation suite
+	$(PYTHON) scripts/10_evaluate.py --config $(CONFIG)
+
+# ---------------------------------------------------------------------------
+# Inference / Serving
+# ---------------------------------------------------------------------------
+
+.PHONY: serve
+serve: ## Start FastAPI inference server
+	$(PYTHON) scripts/11_run_inference.py --config $(CONFIG) --mode serve
+
+.PHONY: inference
+inference: ## Run batch inference
+	$(PYTHON) scripts/11_run_inference.py --config $(CONFIG) --mode batch
+
+# ---------------------------------------------------------------------------
+# Testing & Quality
+# ---------------------------------------------------------------------------
+
+.PHONY: test
+test: ## Run unit tests with coverage
+	$(PYTEST) tests/ -v --cov=src --cov-report=term-missing --cov-report=html:htmlcov
+
+.PHONY: test-fast
+test-fast: ## Run tests without coverage (faster)
+	$(PYTEST) tests/ -v -x
+
+.PHONY: lint
+lint: ## Run linters (ruff, mypy)
+	ruff check src/ tests/ scripts/
+	mypy src/ --ignore-missing-imports
+
+.PHONY: format
+format: ## Auto-format code with black and isort
+	black src/ tests/ scripts/ config/
+	isort src/ tests/ scripts/ config/
+
+.PHONY: check
+check: lint test ## Run linters and tests
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+
+.PHONY: docker-build
+docker-build: ## Build Docker image
+	docker build -t frlm:latest .
+
+.PHONY: docker-run
+docker-run: ## Run training in Docker container
+	docker run --gpus all --rm \
+		-v $(PWD)/data:/app/data \
+		-v $(PWD)/checkpoints:/app/checkpoints \
+		-v $(PWD)/logs:/app/logs \
+		--env-file .env \
+		frlm:latest
+
+.PHONY: docker-serve
+docker-serve: ## Run inference server in Docker
+	docker run --gpus all --rm -p 8000:8000 \
+		-v $(PWD)/checkpoints:/app/checkpoints \
+		--env-file .env \
+		frlm:latest python scripts/11_run_inference.py --config config/default.yaml --mode serve
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+.PHONY: clean
+clean: ## Remove build artifacts, caches, and temp files
+	rm -rf build/ dist/ *.egg-info .eggs/
+	rm -rf __pycache__ src/__pycache__ tests/__pycache__
+	rm -rf .pytest_cache .mypy_cache .ruff_cache
+	rm -rf htmlcov .coverage
+	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	@echo "Cleaned."
+
+.PHONY: clean-data
+clean-data: ## Remove all processed data (keeps raw corpus)
+	rm -rf data/processed/* data/kg/* data/labels/* data/faiss_indices/*
+	@echo "Processed data cleaned."
+
+.PHONY: clean-all
+clean-all: clean clean-data ## Remove everything (artifacts + processed data)
+	rm -rf checkpoints/* logs/*
+	@echo "Full clean complete."
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+.PHONY: help
+help: ## Show this help message
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
