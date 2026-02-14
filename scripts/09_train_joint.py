@@ -1,302 +1,183 @@
 #!/usr/bin/env python3
 """
-09_train_joint.py - Phase 3: Joint fine-tuning with combined loss.
+09_train_joint.py — Phase 3: Joint fine-tuning with combined loss.
 
 Jointly trains all components (backbone, router, retrieval, generation heads)
-using the combined loss: L = 1.0*L_router + 2.0*L_retrieval + 1.0*L_generation.
-Integrates with DeepSpeed for efficient distributed training.
+using the combined loss: L = 1.0×L_router + 2.0×L_retrieval + 1.0×L_generation.
+Integrates with DeepSpeed ZeRO Stage 2 for efficient multi-GPU training.
 
 Pipeline position: Step 9 of 11
 Reads from:  Phase 1 & 2 checkpoints, training data
-Writes to:   config.training.output_dir (checkpoints)
-Config used: config.training.joint, config.loss, config.deepspeed
+Writes to:   config.training.output_dir / phase3_joint (checkpoints)
+Config used: config.training.joint, config.loss, config.deepspeed, config.wandb
+
+Usage
+-----
+    python scripts/09_train_joint.py --config config/default.yaml
+    python scripts/09_train_joint.py --phase1-ckpt ... --phase2-ckpt ...
+
+    # DeepSpeed multi-GPU:
+    deepspeed scripts/09_train_joint.py --config config/default.yaml
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
-import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.config import FRLMConfig, load_config, setup_logging
+from src.model.frlm import FRLMModel
+from src.training.dataset import JointDataset
+from src.training.joint_trainer import JointTrainer
 
 logger = logging.getLogger(__name__)
 
 
-def _load_phase_checkpoints(
-    checkpoint_dir: Path,
-) -> Tuple[Optional[Path], Optional[Path]]:
-    """Locate the best checkpoints from Phase 1 (router) and Phase 2 (retrieval)."""
-    router_dir = checkpoint_dir / "router"
-    retrieval_dir = checkpoint_dir / "retrieval"
-
-    router_ckpt = None
-    retrieval_ckpt = None
-
-    if router_dir.exists():
-        ckpts = sorted(router_dir.glob("router_epoch_*.pt"))
-        if ckpts:
-            router_ckpt = ckpts[-1]
-            logger.info("Found router checkpoint: %s", router_ckpt)
-
-    if retrieval_dir.exists():
-        ckpts = sorted(retrieval_dir.glob("retrieval_epoch_*.json"))
-        if ckpts:
-            retrieval_ckpt = ckpts[-1]
-            logger.info("Found retrieval checkpoint: %s", retrieval_ckpt)
-
-    if router_ckpt is None:
-        logger.warning("No router checkpoint found. Starting from scratch.")
-    if retrieval_ckpt is None:
-        logger.warning("No retrieval checkpoint found. Starting from scratch.")
-
-    return router_ckpt, retrieval_ckpt
-
-
-def _init_deepspeed(cfg: FRLMConfig, model: Any) -> Tuple[Any, Any, Any]:
-    """Initialize DeepSpeed engine from config.
-
-    Returns (engine, optimizer, scheduler).
-    """
-    ds_cfg = cfg.deepspeed
-
-    if not ds_cfg.enabled:
-        logger.info("DeepSpeed disabled. Using standard PyTorch training.")
-        return model, None, None
-
-    logger.info("Initializing DeepSpeed (ZeRO stage %d)", ds_cfg.config.zero_optimization.stage)
-    logger.info("FP16: %s, Gradient clipping: %.1f",
-                ds_cfg.config.fp16.enabled, ds_cfg.config.gradient_clipping)
-
-    # Production:
-    #   import deepspeed
-    #   ds_config = ds_cfg.config.model_dump()
-    #   # Replace "auto" values
-    #   ds_config["train_micro_batch_size_per_gpu"] = cfg.training.joint.batch_size
-    #   ds_config["gradient_accumulation_steps"] = cfg.training.gradient_accumulation_steps
-    #   ds_config["optimizer"]["params"]["lr"] = cfg.training.joint.learning_rate
-    #   ds_config["optimizer"]["params"]["weight_decay"] = cfg.training.joint.weight_decay
-    #
-    #   engine, optimizer, _, scheduler = deepspeed.initialize(
-    #       model=model,
-    #       config=ds_config,
-    #   )
-    #   return engine, optimizer, scheduler
-
-    logger.info("DeepSpeed would be initialized (stub mode)")
-    return model, None, None
-
-
-def _compute_combined_loss(
-    router_loss: float,
-    retrieval_loss: float,
-    generation_loss: float,
-    loss_cfg: Any,
-) -> float:
-    """Compute weighted combined loss: L = w_r*L_r + w_ret*L_ret + w_gen*L_gen."""
-    combined = (
-        loss_cfg.router_weight * router_loss
-        + loss_cfg.retrieval_weight * retrieval_loss
-        + loss_cfg.generation_weight * generation_loss
+def _find_latest_checkpoint(base_dir: Path, prefix: str) -> Optional[Path]:
+    """Auto-discover the latest checkpoint in a phase directory."""
+    if not base_dir.exists():
+        return None
+    dirs = sorted(
+        (d for d in base_dir.iterdir() if d.is_dir() and d.name.startswith(prefix)),
+        key=lambda p: p.stat().st_mtime,
     )
-    return combined
+    return dirs[-1] if dirs else None
 
 
-def _train_epoch(
-    engine: Any,
-    train_data: List[Any],
+def train_joint(
     cfg: FRLMConfig,
-    epoch: int,
-    wandb_run: Any,
+    phase1_checkpoint: str | None = None,
+    phase2_checkpoint: str | None = None,
+    resume_path: str | None = None,
+    no_deepspeed: bool = False,
 ) -> Dict[str, float]:
-    """Run one joint training epoch."""
+    """Execute Phase 3: Joint fine-tuning.
+
+    Parameters
+    ----------
+    cfg : FRLMConfig
+        Loaded configuration.
+    phase1_checkpoint : str, optional
+        Phase 1 router checkpoint dir. Auto-discovered if ``None``.
+    phase2_checkpoint : str, optional
+        Phase 2 retrieval checkpoint dir. Auto-discovered if ``None``.
+    resume_path : str, optional
+        Phase 3 checkpoint to resume from.
+    no_deepspeed : bool
+        Force disable DeepSpeed even if config says enabled.
+
+    Returns
+    -------
+    dict
+        Best validation metrics.
+    """
     joint_cfg = cfg.training.joint
     loss_cfg = cfg.loss
-    num_batches = max(len(train_data) // joint_cfg.batch_size, 1)
 
-    total_router_loss = 0.0
-    total_retrieval_loss = 0.0
-    total_generation_loss = 0.0
-    total_combined_loss = 0.0
-
-    for batch_idx in range(num_batches):
-        # Production:
-        #   hidden = backbone(batch.input_ids, batch.attention_mask)
-        #   router_logits = router_head(hidden)
-        #   router_mask = (torch.sigmoid(router_logits) > cfg.model.router_head.threshold)
-        #   semantic_emb = retrieval_head.semantic(hidden[router_mask])
-        #   gen_logits = generation_head(hidden[~router_mask])
-        #   loss_router = F.binary_cross_entropy_with_logits(router_logits, batch.router_labels)
-        #   loss_retrieval = infonce(semantic_emb, batch.positive_embs, batch.negative_embs, loss_cfg.contrastive_temperature)
-        #   loss_generation = F.cross_entropy(gen_logits, batch.next_token_ids)
-        #   total_loss = compute_combined_loss(loss_router, loss_retrieval, loss_generation, loss_cfg)
-        #   engine.backward(total_loss)
-        #   engine.step()
-
-        decay = np.exp(-0.003 * (epoch * num_batches + batch_idx))
-        r_loss = max(0.4 * decay + np.random.normal(0, 0.015), 0.01)
-        ret_loss = max(1.5 * decay + np.random.normal(0, 0.04), 0.05)
-        g_loss = max(2.0 * decay + np.random.normal(0, 0.05), 0.1)
-        c_loss = _compute_combined_loss(r_loss, ret_loss, g_loss, loss_cfg)
-
-        total_router_loss += r_loss
-        total_retrieval_loss += ret_loss
-        total_generation_loss += g_loss
-        total_combined_loss += c_loss
-
-        step = epoch * num_batches + batch_idx
-        if step % cfg.training.log_every_n_steps == 0 and wandb_run:
-            try:
-                import wandb
-                wandb.log({
-                    "train/router_loss": r_loss,
-                    "train/retrieval_loss": ret_loss,
-                    "train/generation_loss": g_loss,
-                    "train/combined_loss": c_loss,
-                    "train/step": step,
-                })
-            except Exception:
-                pass
-
-    n = max(num_batches, 1)
-    return {
-        "router_loss": total_router_loss / n,
-        "retrieval_loss": total_retrieval_loss / n,
-        "generation_loss": total_generation_loss / n,
-        "combined_loss": total_combined_loss / n,
-    }
-
-
-def _evaluate(
-    engine: Any,
-    val_data: List[Any],
-    cfg: FRLMConfig,
-) -> Dict[str, float]:
-    """Evaluate all components on validation data."""
-    return {
-        "combined_loss": 1.2 + np.random.normal(0, 0.05),
-        "router_f1": 0.89 + np.random.normal(0, 0.01),
-        "precision_at_1": 0.83 + np.random.normal(0, 0.02),
-        "perplexity": 22.5 + np.random.normal(0, 1.0),
-    }
-
-
-def train_joint(cfg: FRLMConfig) -> None:
-    """Execute Phase 3: Joint fine-tuning."""
-    joint_cfg = cfg.training.joint
-    loss_cfg = cfg.loss
-    checkpoint_dir = cfg.paths.resolve("checkpoints_dir")
-    output_dir = checkpoint_dir / "joint"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("=== Phase 3: Joint Fine-tuning ===")
-    logger.info("Epochs: %d, Batch size: %d, LR: %.2e",
-                joint_cfg.epochs, joint_cfg.batch_size, joint_cfg.learning_rate)
-    logger.info("Scheduler: %s (cycles=%d)", joint_cfg.scheduler, joint_cfg.num_cycles)
-    logger.info("Loss weights: router=%.1f, retrieval=%.1f, generation=%.1f",
+    logger.info("=" * 60)
+    logger.info("Phase 3: Joint Fine-Tuning")
+    logger.info("=" * 60)
+    logger.info("  Epochs:       %d", joint_cfg.epochs)
+    logger.info("  Batch size:   %d", joint_cfg.batch_size)
+    logger.info("  LR:           %.2e", joint_cfg.learning_rate)
+    logger.info("  Scheduler:    %s (cycles=%d)", joint_cfg.scheduler, joint_cfg.num_cycles)
+    logger.info("  Warmup:       %.1f%%", joint_cfg.warmup_ratio * 100)
+    logger.info("  Loss weights: router=%.1f  retrieval=%.1f  generation=%.1f",
                 loss_cfg.router_weight, loss_cfg.retrieval_weight, loss_cfg.generation_weight)
-    logger.info("InfoNCE temperature: %.3f", loss_cfg.contrastive_temperature)
+    logger.info("  Temperature:  %.3f", loss_cfg.contrastive_temperature)
+    logger.info("  DeepSpeed:    %s", "disabled" if no_deepspeed else cfg.deepspeed.enabled)
+    logger.info("  Early stop:   %s (patience=%d)", joint_cfg.early_stopping_metric, joint_cfg.early_stopping_patience)
 
-    # Load phase 1 & 2 checkpoints
-    router_ckpt, retrieval_ckpt = _load_phase_checkpoints(checkpoint_dir)
+    # --- Auto-discover prior phase checkpoints ---
+    output_base = Path(cfg.training.output_dir)
+    p1_ckpt = Path(phase1_checkpoint) if phase1_checkpoint else _find_latest_checkpoint(
+        output_base / "phase1_router", "router",
+    )
+    p2_ckpt = Path(phase2_checkpoint) if phase2_checkpoint else _find_latest_checkpoint(
+        output_base / "phase2_retrieval", "retrieval",
+    )
 
-    # Production: build full FRLM model and load checkpoint weights
-    model = None
+    if p1_ckpt:
+        logger.info("Phase 1 checkpoint: %s", p1_ckpt)
+    else:
+        logger.warning("No Phase 1 checkpoint found — starting from scratch")
+    if p2_ckpt:
+        logger.info("Phase 2 checkpoint: %s", p2_ckpt)
+    else:
+        logger.warning("No Phase 2 checkpoint found — starting from scratch")
 
-    # Initialize DeepSpeed
-    engine, optimizer, scheduler = _init_deepspeed(cfg, model)
+    # --- Build model ---
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Building FRLM model...")
+    model = FRLMModel.from_config(cfg)
 
-    # Init WandB
-    wandb_run = None
-    if cfg.wandb.enabled:
-        try:
-            import wandb
-            wandb_run = wandb.init(
-                project=cfg.wandb.project,
-                name=f"joint-{int(time.time())}",
-                tags=cfg.wandb.tags + ["joint", "phase3"],
-                config={
-                    "phase": "joint_finetuning",
-                    "loss_weights": {
-                        "router": loss_cfg.router_weight,
-                        "retrieval": loss_cfg.retrieval_weight,
-                        "generation": loss_cfg.generation_weight,
-                    },
-                },
-            )
-        except Exception as exc:
-            logger.warning("WandB init failed: %s", exc)
+    # --- Build datasets ---
+    data_dir = cfg.paths.resolve("processed_dir")
+    emb_dim = cfg.model.retrieval_head.semantic.output_dim
+    num_neg = (
+        cfg.faiss.hard_negatives.num_hard_negatives
+        + cfg.faiss.hard_negatives.num_random_negatives
+    )
 
-    train_data: List[Any] = [{}] * 100
-    val_data: List[Any] = [{}] * 20
+    logger.info("Loading joint training data from %s", data_dir)
+    full_ds = JointDataset(
+        data_dir=data_dir,
+        max_seq_length=cfg.model.backbone.max_seq_length,
+        embedding_dim=emb_dim,
+        num_negatives=num_neg,
+    )
 
-    best_metric = float("inf")
+    if len(full_ds) == 0:
+        logger.error("No joint training data found in %s.", data_dir)
+        sys.exit(1)
 
-    class _EarlyStopping:
-        def __init__(self, patience: int) -> None:
-            self.patience = patience
-            self.best: Optional[float] = None
-            self.counter = 0
+    val_size = int(len(full_ds) * cfg.training.splits.validation)
+    train_size = len(full_ds) - val_size
+    gen = torch.Generator().manual_seed(cfg.training.seed)
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_ds, [train_size, val_size], generator=gen,
+    )
 
-        def step(self, val: float) -> bool:
-            if self.best is None:
-                self.best = val
-                return False
-            if val < self.best:
-                self.best, self.counter = val, 0
-            else:
-                self.counter += 1
-            return self.counter >= self.patience
+    logger.info("Data split: train=%d, val=%d", len(train_ds), len(val_ds))
 
-    early_stopping = _EarlyStopping(patience=joint_cfg.early_stopping_patience)
+    # --- Create trainer ---
+    use_ds = None if not no_deepspeed else False
+    trainer = JointTrainer(
+        model=model,
+        config=cfg,
+        train_dataset=train_ds,
+        val_dataset=val_ds,
+        device=device,
+        use_deepspeed=use_ds,
+    )
 
-    for epoch in range(joint_cfg.epochs):
-        logger.info("--- Epoch %d/%d ---", epoch + 1, joint_cfg.epochs)
+    # --- Resume ---
+    if resume_path is not None:
+        logger.info("Resuming from Phase 3 checkpoint: %s", resume_path)
+        trainer.resume_from_checkpoint(resume_path)
 
-        train_metrics = _train_epoch(engine, train_data, cfg, epoch, wandb_run)
-        val_metrics = _evaluate(engine, val_data, cfg)
+    # --- Train ---
+    t0 = time.time()
+    best_metrics = trainer.train(
+        phase1_checkpoint=p1_ckpt,
+        phase2_checkpoint=p2_ckpt,
+    )
+    elapsed = time.time() - t0
 
-        logger.info(
-            "Train - combined: %.4f (R:%.4f + Ret:%.4f + Gen:%.4f)",
-            train_metrics["combined_loss"],
-            train_metrics["router_loss"],
-            train_metrics["retrieval_loss"],
-            train_metrics["generation_loss"],
-        )
-        logger.info(
-            "Val   - combined: %.4f, router_f1: %.4f, P@1: %.4f, PPL: %.2f",
-            val_metrics["combined_loss"],
-            val_metrics["router_f1"],
-            val_metrics["precision_at_1"],
-            val_metrics["perplexity"],
-        )
+    logger.info("=" * 60)
+    logger.info("Phase 3 Complete — %.1f s", elapsed)
+    for k, v in best_metrics.items():
+        logger.info("  best_%s = %.4f", k, v)
+    logger.info("=" * 60)
 
-        current = val_metrics["combined_loss"]
-        if current < best_metric:
-            best_metric = current
-            meta = {"epoch": epoch, "metrics": {**train_metrics, **val_metrics}}
-            with open(output_dir / f"joint_epoch_{epoch:03d}.json", "w") as fh:
-                json.dump(meta, fh, indent=2)
-            logger.info("New best combined loss: %.4f", best_metric)
-
-        if early_stopping.step(current):
-            logger.info("Early stopping at epoch %d", epoch + 1)
-            break
-
-    logger.info("=== Joint Training Complete. Best combined loss: %.4f ===", best_metric)
-
-    if wandb_run:
-        try:
-            wandb_run.finish()
-        except Exception:
-            pass
+    return best_metrics
 
 
 def main() -> None:
@@ -305,9 +186,30 @@ def main() -> None:
         description="Phase 3: Joint fine-tuning with combined loss.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--config", type=str, default="config/default.yaml")
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--local_rank", type=int, default=-1, help="DeepSpeed local rank.")
+    parser.add_argument(
+        "--config", type=str, default="config/default.yaml",
+        help="Path to YAML config file.",
+    )
+    parser.add_argument(
+        "--phase1-ckpt", type=str, default=None,
+        help="Path to Phase 1 router checkpoint directory.",
+    )
+    parser.add_argument(
+        "--phase2-ckpt", type=str, default=None,
+        help="Path to Phase 2 retrieval checkpoint directory.",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Path to Phase 3 checkpoint directory to resume from.",
+    )
+    parser.add_argument(
+        "--no-deepspeed", action="store_true",
+        help="Force disable DeepSpeed (use standard PyTorch).",
+    )
+    parser.add_argument(
+        "--local_rank", type=int, default=-1,
+        help="DeepSpeed local rank (set automatically by deepspeed launcher).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -315,9 +217,15 @@ def main() -> None:
     logger.info("Starting 09_train_joint with config: %s", args.config)
 
     try:
-        train_joint(cfg)
+        train_joint(
+            cfg,
+            phase1_checkpoint=args.phase1_ckpt,
+            phase2_checkpoint=args.phase2_ckpt,
+            resume_path=args.resume,
+            no_deepspeed=args.no_deepspeed,
+        )
     except KeyboardInterrupt:
-        logger.warning("Joint training interrupted.")
+        logger.warning("Joint training interrupted by user.")
         sys.exit(130)
     except Exception:
         logger.exception("Joint training failed.")
