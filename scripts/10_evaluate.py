@@ -3,11 +3,12 @@
 10_evaluate.py - Run the full evaluation suite.
 
 Evaluates retrieval (P@k, temporal accuracy), generation (perplexity),
-router (accuracy, confusion matrix, calibration), and end-to-end metrics.
+router (accuracy, confusion matrix, calibration), and end-to-end metrics
+using the real evaluator classes from ``src.evaluation``.
 
 Pipeline position: Step 10 of 11
-Reads from:  Trained model checkpoints, test data
-Writes to:   config.paths.logs_dir (evaluation results JSON)
+Reads from:  Trained model checkpoints, test data, FAISS index, KG
+Writes to:   config.paths.export_dir (evaluation results JSON)
 Config used: config.evaluation, config.model, config.paths
 """
 
@@ -21,154 +22,262 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config.config import FRLMConfig, load_config, setup_logging
+from src.evaluation.end_to_end import EndToEndEvaluator
+from src.evaluation.generation_eval import GenerationEvaluator
+from src.evaluation.retrieval_eval import RetrievalEvaluator
+from src.evaluation.router_eval import RouterEvaluator
 
 logger = logging.getLogger(__name__)
 
 
-def _evaluate_retrieval(cfg: FRLMConfig) -> Dict[str, Any]:
-    """Evaluate retrieval head: P@k for configured k values, temporal and granularity accuracy."""
-    eval_cfg = cfg.evaluation.retrieval
-    logger.info("Evaluating retrieval: k_values=%s, samples=%d", eval_cfg.k_values, eval_cfg.num_eval_samples)
-
-    results: Dict[str, Any] = {}
-
-    # Production:
-    #   model.eval()
-    #   for batch in test_loader:
-    #       query_emb = retrieval_head.semantic(backbone(batch))
-    #       D, I = faiss_index.search(query_emb, max(k_values))
-    #       for k in k_values:
-    #           hits += (batch.labels in I[:, :k]).sum()
-
-    for k in eval_cfg.k_values:
-        base = 0.85 * (1.0 / (1.0 + 0.06 * (k - 1)))
-        results[f"P@{k}"] = round(float(np.clip(base + np.random.normal(0, 0.01), 0, 1)), 4)
-
-    results["MRR"] = round(float(0.78 + np.random.normal(0, 0.01)), 4)
-
-    if eval_cfg.temporal_accuracy:
-        results["temporal_accuracy"] = round(float(0.86 + np.random.normal(0, 0.02)), 4)
-        results["temporal_by_mode"] = {
-            "CURRENT": round(float(0.91 + np.random.normal(0, 0.01)), 4),
-            "AT_TIMESTAMP": round(float(0.76 + np.random.normal(0, 0.02)), 4),
-            "HISTORY": round(float(0.83 + np.random.normal(0, 0.02)), 4),
-        }
-
-    if eval_cfg.granularity_accuracy:
-        results["granularity_accuracy"] = round(float(0.88 + np.random.normal(0, 0.02)), 4)
-
-    logger.info("Retrieval results: %s", {k: v for k, v in results.items() if not isinstance(v, dict)})
-    return results
+# ===========================================================================
+# Model & resource loading
+# ===========================================================================
 
 
-def _evaluate_generation(cfg: FRLMConfig) -> Dict[str, Any]:
-    """Evaluate generation head: perplexity and optional BLEU/ROUGE."""
-    eval_cfg = cfg.evaluation.generation
-    logger.info("Evaluating generation: samples=%d", eval_cfg.num_eval_samples)
+def _load_model(cfg: FRLMConfig, checkpoint: Optional[str] = None) -> Any:
+    """Load the trained FRLM model."""
+    from src.model.frlm import FRLMModel
 
-    results: Dict[str, Any] = {}
+    if checkpoint:
+        ckpt_path = Path(checkpoint)
+    else:
+        ckpt_path = cfg.paths.resolve("checkpoints_dir") / "joint"
 
-    if eval_cfg.compute_perplexity:
-        results["perplexity"] = round(float(22.5 + np.random.normal(0, 1.0)), 2)
-        results["cross_entropy_loss"] = round(float(np.log(results["perplexity"])), 4)
+    logger.info("Loading FRLM model from %s", ckpt_path)
 
-    if eval_cfg.compute_bleu:
-        results["bleu"] = round(float(0.35 + np.random.normal(0, 0.02)), 4)
+    if ckpt_path.exists():
+        model = FRLMModel.from_pretrained(str(ckpt_path), device=cfg.inference.device)
+    else:
+        logger.warning("Checkpoint not found at %s — building from config", ckpt_path)
+        model = FRLMModel.from_config(cfg)
 
-    if eval_cfg.compute_rouge:
-        results["rouge_l"] = round(float(0.42 + np.random.normal(0, 0.02)), 4)
-
-    logger.info("Generation results: %s", results)
-    return results
-
-
-def _evaluate_router(cfg: FRLMConfig) -> Dict[str, Any]:
-    """Evaluate router: accuracy, threshold sweep, confusion matrix, calibration."""
-    eval_cfg = cfg.evaluation.router
-    logger.info("Evaluating router: samples=%d, thresholds=%s",
-                eval_cfg.num_eval_samples, eval_cfg.threshold_sweep)
-
-    results: Dict[str, Any] = {}
-
-    # Threshold sweep
-    sweep: List[Dict[str, Any]] = []
-    for t in eval_cfg.threshold_sweep:
-        sweep.append({
-            "threshold": t,
-            "accuracy": round(float(0.85 + (0.5 - t) * 0.1 + np.random.normal(0, 0.01)), 4),
-            "precision": round(float(0.83 + np.random.normal(0, 0.02)), 4),
-            "recall": round(float(0.87 + np.random.normal(0, 0.02)), 4),
-            "f1": round(float(0.85 + np.random.normal(0, 0.02)), 4),
-        })
-
-    results["threshold_sweep"] = sweep
-    best = max(sweep, key=lambda x: x["f1"])
-    results["best_threshold"] = best["threshold"]
-    results["best_f1"] = best["f1"]
-    results["best_accuracy"] = best["accuracy"]
-
-    if eval_cfg.compute_confusion_matrix:
-        # [[TN, FP], [FN, TP]]
-        n = eval_cfg.num_eval_samples
-        tp = int(n * 0.35)
-        tn = int(n * 0.50)
-        fp = int(n * 0.07)
-        fn = n - tp - tn - fp
-        results["confusion_matrix"] = [[tn, fp], [fn, tp]]
-
-    if eval_cfg.compute_calibration:
-        results["expected_calibration_error"] = round(float(0.04 + np.random.normal(0, 0.005)), 4)
-
-    logger.info("Router results: best_f1=%.4f at threshold=%.2f", results["best_f1"], results["best_threshold"])
-    return results
+    model.eval()
+    return model
 
 
-def _evaluate_end_to_end(cfg: FRLMConfig) -> Dict[str, Any]:
-    """Evaluate full pipeline end-to-end."""
-    eval_cfg = cfg.evaluation.end_to_end
-    logger.info("Evaluating end-to-end: samples=%d", eval_cfg.num_eval_samples)
+def _load_faiss_index(cfg: FRLMConfig) -> Any:
+    """Load the FAISS index."""
+    index_dir = cfg.paths.resolve("faiss_index_dir")
+    level = cfg.faiss.hierarchical.default_level
+    level_name = getattr(cfg.faiss.hierarchical, f"level_{level}")
+    index_path = index_dir / f"index_level_{level}_{level_name}.faiss"
 
-    results: Dict[str, Any] = {}
+    if not index_path.exists():
+        logger.warning("FAISS index not found at %s", index_path)
+        return None
 
-    if eval_cfg.compute_factual_accuracy:
-        results["factual_accuracy"] = round(float(0.81 + np.random.normal(0, 0.02)), 4)
+    import faiss
 
-    if eval_cfg.compute_temporal_consistency:
-        results["temporal_consistency"] = round(float(0.88 + np.random.normal(0, 0.02)), 4)
+    index = faiss.read_index(str(index_path))
+    if cfg.faiss.use_gpu:
+        res = faiss.StandardGpuResources()
+        index = faiss.index_cpu_to_gpu(res, cfg.faiss.gpu_id, index)
+    index.nprobe = cfg.faiss.nprobe
+    logger.info("FAISS index loaded from %s (%d vectors)", index_path, index.ntotal)
+    return index
 
-    results["overall_score"] = round(
-        float(np.mean([v for v in results.values() if isinstance(v, float)])), 4
+
+def _load_kg_client(cfg: FRLMConfig) -> Any:
+    """Connect to the Neo4j KG."""
+    from src.kg.neo4j_client import Neo4jClient
+
+    try:
+        client = Neo4jClient.from_config(cfg.neo4j)
+        logger.info("KG client connected: %s", cfg.neo4j.uri)
+        return client
+    except Exception as e:
+        logger.warning("KG client connection failed: %s", e)
+        return None
+
+
+# ===========================================================================
+# Component evaluation functions
+# ===========================================================================
+
+
+def _evaluate_retrieval(
+    model: Any,
+    cfg: FRLMConfig,
+    faiss_index: Any,
+    kg_client: Any,
+    test_loader: Any,
+) -> Dict[str, Any]:
+    """Evaluate retrieval head using RetrievalEvaluator."""
+    evaluator = RetrievalEvaluator.from_config(cfg.evaluation.retrieval)
+    logger.info(
+        "Evaluating retrieval: k_values=%s, samples=%d",
+        evaluator.k_values,
+        cfg.evaluation.retrieval.num_eval_samples,
     )
 
-    logger.info("End-to-end results: %s", results)
-    return results
+    if test_loader is not None and faiss_index is not None:
+        results = evaluator.evaluate(
+            model=model,
+            dataloader=test_loader,
+            faiss_index=faiss_index,
+            kg_client=kg_client,
+            max_samples=cfg.evaluation.retrieval.num_eval_samples,
+        )
+        return results.to_dict()
+
+    logger.warning("Retrieval test data or FAISS index unavailable — skipping live eval")
+    return {"status": "skipped", "reason": "missing_resources"}
 
 
-def evaluate(cfg: FRLMConfig) -> None:
+def _evaluate_generation(
+    model: Any,
+    cfg: FRLMConfig,
+    test_loader: Any,
+) -> Dict[str, Any]:
+    """Evaluate generation head using GenerationEvaluator."""
+    evaluator = GenerationEvaluator.from_config(cfg.evaluation.generation)
+    logger.info(
+        "Evaluating generation: samples=%d",
+        cfg.evaluation.generation.num_eval_samples,
+    )
+
+    if test_loader is not None:
+        results = evaluator.evaluate(
+            model=model,
+            dataloader=test_loader,
+            max_samples=cfg.evaluation.generation.num_eval_samples,
+        )
+        return results.to_dict()
+
+    logger.warning("Generation test data unavailable — skipping live eval")
+    return {"status": "skipped", "reason": "missing_resources"}
+
+
+def _evaluate_router(
+    model: Any,
+    cfg: FRLMConfig,
+    test_loader: Any,
+) -> Dict[str, Any]:
+    """Evaluate router head using RouterEvaluator."""
+    evaluator = RouterEvaluator.from_config(cfg.evaluation.router)
+    logger.info(
+        "Evaluating router: thresholds=%s, samples=%d",
+        evaluator.threshold_sweep_values,
+        cfg.evaluation.router.num_eval_samples,
+    )
+
+    if test_loader is not None:
+        results = evaluator.evaluate(
+            model=model,
+            dataloader=test_loader,
+            max_samples=cfg.evaluation.router.num_eval_samples,
+        )
+        return results.to_dict()
+
+    logger.warning("Router test data unavailable — skipping live eval")
+    return {"status": "skipped", "reason": "missing_resources"}
+
+
+def _evaluate_end_to_end(
+    model: Any,
+    cfg: FRLMConfig,
+    test_loaders: Dict[str, Any],
+    faiss_index: Any,
+    kg_client: Any,
+) -> Dict[str, Any]:
+    """Evaluate full pipeline using EndToEndEvaluator."""
+    evaluator = EndToEndEvaluator.from_config(cfg.evaluation)
+    logger.info(
+        "Evaluating end-to-end: samples=%d",
+        cfg.evaluation.end_to_end.num_eval_samples,
+    )
+
+    config_snapshot = {
+        "backbone": cfg.model.backbone.name,
+        "loss_weights": {
+            "router": cfg.loss.router_weight,
+            "retrieval": cfg.loss.retrieval_weight,
+            "generation": cfg.loss.generation_weight,
+        },
+    }
+
+    results = evaluator.evaluate(
+        model=model,
+        retrieval_dataloader=test_loaders.get("retrieval"),
+        generation_dataloader=test_loaders.get("generation"),
+        router_dataloader=test_loaders.get("router"),
+        faiss_index=faiss_index,
+        kg_client=kg_client,
+        max_samples=cfg.evaluation.end_to_end.num_eval_samples,
+        config_snapshot=config_snapshot,
+    )
+    return results.to_dict()
+
+
+# ===========================================================================
+# Main orchestration
+# ===========================================================================
+
+
+def evaluate(
+    cfg: FRLMConfig,
+    checkpoint: Optional[str] = None,
+    components: str = "all",
+) -> None:
     """Run the complete evaluation suite and save results."""
-    logs_dir = cfg.paths.resolve("logs_dir")
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = cfg.paths.resolve("export_dir")
+    export_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=== Full Evaluation Suite ===")
-
     start_time = time.time()
+
+    # Parse requested components
+    if components == "all":
+        run_retrieval = run_generation = run_router = run_e2e = True
+    else:
+        parts = {c.strip().lower() for c in components.split(",")}
+        run_retrieval = "retrieval" in parts
+        run_generation = "generation" in parts
+        run_router = "router" in parts
+        run_e2e = "e2e" in parts or "end_to_end" in parts
+
+    # Load model
+    model = _load_model(cfg, checkpoint)
+
+    # Load resources
+    faiss_index = _load_faiss_index(cfg) if (run_retrieval or run_e2e) else None
+    kg_client = _load_kg_client(cfg) if (run_retrieval or run_e2e) else None
+
+    # NOTE: In production, test dataloaders would be built from
+    #   the processed test split. For now, we pass None and the
+    #   evaluators will report "skipped".
+    test_loader = None
+
     all_results: Dict[str, Any] = {}
 
-    logger.info("--- Retrieval Evaluation ---")
-    all_results["retrieval"] = _evaluate_retrieval(cfg)
+    if run_retrieval:
+        logger.info("--- Retrieval Evaluation ---")
+        all_results["retrieval"] = _evaluate_retrieval(
+            model, cfg, faiss_index, kg_client, test_loader
+        )
 
-    logger.info("--- Generation Evaluation ---")
-    all_results["generation"] = _evaluate_generation(cfg)
+    if run_generation:
+        logger.info("--- Generation Evaluation ---")
+        all_results["generation"] = _evaluate_generation(model, cfg, test_loader)
 
-    logger.info("--- Router Evaluation ---")
-    all_results["router"] = _evaluate_router(cfg)
+    if run_router:
+        logger.info("--- Router Evaluation ---")
+        all_results["router"] = _evaluate_router(model, cfg, test_loader)
 
-    logger.info("--- End-to-End Evaluation ---")
-    all_results["end_to_end"] = _evaluate_end_to_end(cfg)
+    if run_e2e:
+        logger.info("--- End-to-End Evaluation ---")
+        test_loaders: Dict[str, Any] = {
+            "retrieval": test_loader,
+            "generation": test_loader,
+            "router": test_loader,
+        }
+        all_results["end_to_end"] = _evaluate_end_to_end(
+            model, cfg, test_loaders, faiss_index, kg_client
+        )
 
     total_time = time.time() - start_time
     all_results["evaluation_time_seconds"] = round(total_time, 2)
@@ -181,24 +290,31 @@ def evaluate(cfg: FRLMConfig) -> None:
         },
     }
 
-    output_path = logs_dir / "eval_results.json"
+    output_path = export_dir / "eval_results.json"
     with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(all_results, fh, indent=2)
+        json.dump(all_results, fh, indent=2, ensure_ascii=False)
 
     logger.info("=== Evaluation Complete (%.2fs) ===", total_time)
     logger.info("Results saved to %s", output_path)
 
     # Print summary
     logger.info("--- Summary ---")
-    if "retrieval" in all_results:
+    if "retrieval" in all_results and "MRR" in all_results["retrieval"]:
+        logger.info("  MRR: %.4f", all_results["retrieval"]["MRR"])
         for k in cfg.evaluation.retrieval.k_values:
-            logger.info("  P@%d: %.4f", k, all_results["retrieval"].get(f"P@{k}", 0))
-    if "generation" in all_results:
-        logger.info("  Perplexity: %.2f", all_results["generation"].get("perplexity", 0))
-    if "router" in all_results:
-        logger.info("  Router F1: %.4f", all_results["router"].get("best_f1", 0))
-    if "end_to_end" in all_results:
-        logger.info("  E2E Score: %.4f", all_results["end_to_end"].get("overall_score", 0))
+            pk_key = f"P@{k}"
+            if pk_key in all_results["retrieval"]:
+                logger.info("  %s: %.4f", pk_key, all_results["retrieval"][pk_key])
+    if "generation" in all_results and "overall_perplexity" in all_results["generation"]:
+        logger.info(
+            "  Perplexity: %.2f", all_results["generation"]["overall_perplexity"]
+        )
+    if "router" in all_results and "best_f1" in all_results["router"]:
+        logger.info("  Router F1: %.4f", all_results["router"]["best_f1"])
+    if "end_to_end" in all_results and "overall_score" in all_results["end_to_end"]:
+        logger.info(
+            "  E2E Score: %.4f", all_results["end_to_end"]["overall_score"]
+        )
 
 
 def main() -> None:
@@ -208,9 +324,18 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", type=str, default="config/default.yaml")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
-    parser.add_argument("--components", type=str, default="all",
-                        help="Comma-separated: retrieval,generation,router,e2e,all")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to model checkpoint directory.",
+    )
+    parser.add_argument(
+        "--components",
+        type=str,
+        default="all",
+        help="Comma-separated: retrieval,generation,router,e2e,all",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -218,7 +343,7 @@ def main() -> None:
     logger.info("Starting 10_evaluate with config: %s", args.config)
 
     try:
-        evaluate(cfg)
+        evaluate(cfg, checkpoint=args.checkpoint, components=args.components)
     except KeyboardInterrupt:
         logger.warning("Evaluation interrupted.")
         sys.exit(130)

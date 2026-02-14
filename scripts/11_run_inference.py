@@ -2,11 +2,11 @@
 """
 11_run_inference.py - Run inference in batch or serve mode.
 
-In batch mode: processes input texts and generates outputs.
-In serve mode: starts a FastAPI server for real-time inference.
+In batch mode: processes input texts via InferencePipeline.
+In serve mode: starts the FastAPI server from src.inference.server.
 
 Pipeline position: Step 11 of 11
-Reads from:  Trained model checkpoint, FAISS index
+Reads from:  Trained model checkpoint, FAISS index, KG
 Config used: config.inference, config.serving, config.model
 """
 
@@ -21,29 +21,46 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config.config import FRLMConfig, load_config, setup_logging
 
 logger = logging.getLogger(__name__)
 
 
+# ===========================================================================
+# Resource loading
+# ===========================================================================
+
+
 def _load_model(cfg: FRLMConfig) -> Any:
     """Load the trained FRLM model from the latest joint checkpoint."""
-    checkpoint_dir = cfg.paths.resolve("checkpoints_dir") / "joint"
+    from src.model.frlm import FRLMModel
 
+    checkpoint_dir = cfg.paths.resolve("checkpoints_dir") / "joint"
     logger.info("Loading FRLM model from %s", checkpoint_dir)
     logger.info("Backbone: %s", cfg.model.backbone.name)
     logger.info("Device: %s, Dtype: %s", cfg.inference.device, cfg.inference.dtype)
 
-    # Production:
-    #   from src.model.frlm import FRLMModel
-    #   model = FRLMModel(cfg)
-    #   checkpoint = torch.load(latest_ckpt, map_location=cfg.inference.device)
-    #   model.load_state_dict(checkpoint["model_state_dict"])
-    #   model.eval()
-    #   return model
+    if checkpoint_dir.exists():
+        model = FRLMModel.from_pretrained(str(checkpoint_dir), device=cfg.inference.device)
+    else:
+        logger.warning("Checkpoint not found — building from config")
+        model = FRLMModel.from_config(cfg)
 
-    logger.info("Model loaded (stub mode)")
-    return None
+    model.eval()
+    logger.info("Model loaded successfully")
+    return model
+
+
+def _load_tokenizer(cfg: FRLMConfig) -> Any:
+    """Load the tokenizer matching the backbone."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.backbone.name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    logger.info("Tokenizer loaded: %s (vocab=%d)", cfg.model.backbone.name, len(tokenizer))
+    return tokenizer
 
 
 def _load_faiss_index(cfg: FRLMConfig) -> Any:
@@ -53,77 +70,58 @@ def _load_faiss_index(cfg: FRLMConfig) -> Any:
     level_name = getattr(cfg.faiss.hierarchical, f"level_{level}")
     index_path = index_dir / f"index_level_{level}_{level_name}.faiss"
 
-    logger.info("Loading FAISS index: %s (level %d: %s)", index_path, level, level_name)
+    if not index_path.exists():
+        logger.warning("FAISS index not found at %s", index_path)
+        return None
 
-    # Production:
-    #   import faiss
-    #   index = faiss.read_index(str(index_path))
-    #   if cfg.faiss.use_gpu:
-    #       res = faiss.StandardGpuResources()
-    #       index = faiss.index_cpu_to_gpu(res, cfg.faiss.gpu_id, index)
-    #   index.nprobe = cfg.faiss.nprobe
-    #   return index
+    import faiss
 
-    logger.info("FAISS index loaded (stub mode)")
-    return None
+    index = faiss.read_index(str(index_path))
+    if cfg.faiss.use_gpu:
+        res = faiss.StandardGpuResources()
+        index = faiss.index_cpu_to_gpu(res, cfg.faiss.gpu_id, index)
+    index.nprobe = cfg.faiss.nprobe
+    logger.info("FAISS index loaded: %s (%d vectors)", index_path, index.ntotal)
+    return index
 
 
-def _run_batch_inference(
-    model: Any,
-    faiss_index: Any,
-    inputs: List[str],
-    cfg: FRLMConfig,
-) -> List[Dict[str, Any]]:
-    """Run inference on a batch of inputs.
+def _load_kg_client(cfg: FRLMConfig) -> Any:
+    """Connect to the Neo4j KG."""
+    from src.kg.neo4j_client import Neo4jClient
 
-    For each input:
-    1. Tokenize and encode through backbone.
-    2. Router decides retrieval vs. generation per token.
-    3. Retrieval tokens: query FAISS, fetch facts from KG.
-    4. Generation tokens: standard next-token prediction.
-    5. Assemble final output.
-    """
-    results: List[Dict[str, Any]] = []
-    inf_cfg = cfg.inference
+    try:
+        client = Neo4jClient.from_config(cfg.neo4j)
+        logger.info("KG client connected: %s", cfg.neo4j.uri)
+        return client
+    except Exception as e:
+        logger.warning("KG client connection failed: %s", e)
+        return None
 
-    for text in inputs:
-        start = time.time()
 
-        # Production:
-        #   tokens = tokenizer(text, return_tensors="pt").to(inf_cfg.device)
-        #   with torch.no_grad():
-        #       hidden = backbone(tokens)
-        #       router_probs = torch.sigmoid(router_head(hidden))
-        #       retrieval_mask = router_probs > inf_cfg.router_threshold
-        #       if retrieval_mask.any():
-        #           query_emb = retrieval_head.semantic(hidden[retrieval_mask])
-        #           D, I = faiss_index.search(query_emb.cpu().numpy(), cfg.faiss.search_k)
-        #           facts = fetch_facts_from_kg(I)
-        #       gen_logits = generation_head(hidden)
-        #       output = assemble_output(gen_logits, facts, router_probs)
-
-        result = {
-            "input": text,
-            "output": f"[FRLM output for: {text[:50]}...]",
-            "router_decisions": {
-                "retrieval_fraction": 0.35,
-                "generation_fraction": 0.65,
-            },
-            "retrieved_facts": [],
-            "inference_time_ms": round((time.time() - start) * 1000, 2),
-        }
-        results.append(result)
-        logger.debug("Processed: %s... (%.1fms)", text[:30], result["inference_time_ms"])
-
-    return results
+# ===========================================================================
+# Batch inference
+# ===========================================================================
 
 
 def run_batch(cfg: FRLMConfig, input_file: Optional[str] = None) -> None:
-    """Run batch inference on input texts."""
+    """Run batch inference on input texts using InferencePipeline."""
+    from src.inference.pipeline import InferencePipeline
+
     logger.info("=== Batch Inference ===")
 
     model = _load_model(cfg)
+    tokenizer = _load_tokenizer(cfg)
     faiss_index = _load_faiss_index(cfg)
+    kg_client = _load_kg_client(cfg)
+
+    pipeline = InferencePipeline(
+        model=model,
+        tokenizer=tokenizer,
+        faiss_index=faiss_index,
+        kg_client=kg_client,
+        config=cfg.inference,
+        device=cfg.inference.device,
+    )
 
     # Load inputs
     inputs: List[str] = []
@@ -145,7 +143,11 @@ def run_batch(cfg: FRLMConfig, input_file: Optional[str] = None) -> None:
         ]
         logger.info("Using %d demo inputs", len(inputs))
 
-    results = _run_batch_inference(model, faiss_index, inputs, cfg)
+    # Run pipeline
+    responses = pipeline.generate_batch(inputs)
+
+    # Serialize results
+    results = [resp.to_dict() for resp in responses]
 
     output_path = cfg.paths.resolve("export_dir") / "inference_results.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,46 +156,72 @@ def run_batch(cfg: FRLMConfig, input_file: Optional[str] = None) -> None:
 
     logger.info("Batch inference complete: %d results saved to %s", len(results), output_path)
 
+    # Print summary
+    for resp in responses:
+        logger.info(
+            "  [%d tok, %.1fms, ret=%.0f%%] %s... → %s...",
+            resp.num_tokens_generated,
+            resp.inference_time_ms,
+            resp.retrieval_fraction * 100,
+            resp.prompt[:40],
+            resp.generated_text[:60],
+        )
+
+
+# ===========================================================================
+# Server mode
+# ===========================================================================
+
 
 def run_server(cfg: FRLMConfig) -> None:
     """Start the FastAPI inference server."""
+    from src.inference.pipeline import InferencePipeline
+    from src.inference.server import create_app
+
     serving_cfg = cfg.serving
-
     logger.info("=== Starting Inference Server ===")
-    logger.info("Host: %s, Port: %d, Workers: %d",
-                serving_cfg.host, serving_cfg.port, serving_cfg.workers)
+    logger.info(
+        "Host: %s, Port: %d, Workers: %d",
+        serving_cfg.host,
+        serving_cfg.port,
+        serving_cfg.workers,
+    )
 
-    # Production:
-    #   from src.inference.server import create_app
-    #   app = create_app(cfg)
-    #   import uvicorn
-    #   uvicorn.run(
-    #       app,
-    #       host=serving_cfg.host,
-    #       port=serving_cfg.port,
-    #       workers=serving_cfg.workers,
-    #       log_level=serving_cfg.log_level,
-    #       reload=serving_cfg.reload,
-    #   )
+    # Load resources
+    model = _load_model(cfg)
+    tokenizer = _load_tokenizer(cfg)
+    faiss_index = _load_faiss_index(cfg)
+    kg_client = _load_kg_client(cfg)
 
-    logger.info("Server would start at http://%s:%d (stub mode)", serving_cfg.host, serving_cfg.port)
-    logger.info("CORS origins: %s", serving_cfg.cors_origins)
-    logger.info("Max concurrent requests: %d", serving_cfg.max_concurrent_requests)
-    logger.info("Request timeout: %ds", serving_cfg.request_timeout)
+    pipeline = InferencePipeline(
+        model=model,
+        tokenizer=tokenizer,
+        faiss_index=faiss_index,
+        kg_client=kg_client,
+        config=cfg.inference,
+        device=cfg.inference.device,
+    )
 
     if serving_cfg.model_warmup:
-        logger.info("Running model warmup inference...")
+        pipeline.warmup()
 
-    try:
-        import uvicorn
+    app = create_app(pipeline=pipeline, kg_client=kg_client, config=cfg)
 
-        # In production, would run the actual FastAPI app
-        logger.info("uvicorn available — server would start normally")
-        logger.info("Press Ctrl+C to stop (stub mode, not actually serving)")
+    import uvicorn
 
-    except ImportError:
-        logger.error("uvicorn not installed. Install with: pip install uvicorn[standard]")
-        sys.exit(1)
+    uvicorn.run(
+        app,
+        host=serving_cfg.host,
+        port=serving_cfg.port,
+        workers=serving_cfg.workers,
+        log_level=serving_cfg.log_level,
+        reload=serving_cfg.reload,
+    )
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
 
 
 def main() -> None:
@@ -203,10 +231,19 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", type=str, default="config/default.yaml")
-    parser.add_argument("--mode", type=str, choices=["batch", "serve"], default="batch",
-                        help="Inference mode: batch processing or HTTP server.")
-    parser.add_argument("--input", type=str, default=None,
-                        help="Input file for batch mode (JSON or text, one per line).")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["batch", "serve"],
+        default="batch",
+        help="Inference mode: batch processing or HTTP server.",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Input file for batch mode (JSON or text, one per line).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
