@@ -12,6 +12,7 @@ Defines:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import date
 from enum import Enum
@@ -333,6 +334,7 @@ class Fact(BaseModel):
             "source": self.source,
             "confidence": self.confidence,
             "family_key": self.family_key,
+            "metadata": json.dumps(self.metadata) if self.metadata else "{}",
         }
 
     def __hash__(self) -> int:

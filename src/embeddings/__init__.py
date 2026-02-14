@@ -6,11 +6,11 @@ with IVF-PQ on GPU, and hierarchical multi-level indexing.
 """
 
 from src.embeddings.sapbert import SapBERTEncoder
-from src.embeddings.faiss_index import FAISSIndex
+from src.embeddings.faiss_index import FAISSFactIndex
 from src.embeddings.hierarchical import HierarchicalIndex
 
 __all__ = [
     "SapBERTEncoder",
-    "FAISSIndex",
+    "FAISSFactIndex",
     "HierarchicalIndex",
 ]

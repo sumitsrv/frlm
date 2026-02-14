@@ -11,6 +11,7 @@ Validates:
 """
 
 import hashlib
+import json
 import os
 import sys
 from datetime import date
@@ -554,6 +555,29 @@ class TestFactModel:
     def test_version_chain_default_empty(self) -> None:
         fact = _make_fact()
         assert fact.version_chain == []
+
+    def test_to_neo4j_properties_includes_metadata(self) -> None:
+        fact = Fact(
+            subject=_make_entity("C0001", "Drug-A", "Drug"),
+            relation=Relation(type="TREATS"),
+            object=_make_entity("C0002", "Disease-B", "Disease"),
+            temporal=TemporalEnvelope(valid_from=date(2024, 1, 1)),
+            source="PMID:99999",
+            confidence=0.9,
+            metadata={"evidence_span": "Drug-A treats Disease-B", "model": "claude"},
+        )
+        props = fact.to_neo4j_properties()
+        assert "metadata" in props
+        parsed = json.loads(props["metadata"])
+        assert parsed["evidence_span"] == "Drug-A treats Disease-B"
+        assert parsed["model"] == "claude"
+
+    def test_to_neo4j_properties_empty_metadata(self) -> None:
+        fact = _make_fact()
+        props = fact.to_neo4j_properties()
+        assert "metadata" in props
+        parsed = json.loads(props["metadata"])
+        assert parsed == {}
 
 
 # ===========================================================================

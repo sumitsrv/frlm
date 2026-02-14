@@ -10,6 +10,7 @@ and testability.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import date
@@ -93,7 +94,7 @@ CYPHER_CREATE_FACT = (
     "f.relation_type = $relation_type, f.object_id = $object_id, "
     "f.object_label = $object_label, f.valid_from = $valid_from, "
     "f.valid_to = $valid_to, f.source = $source, f.confidence = $confidence, "
-    "f.family_key = $family_key "
+    "f.family_key = $family_key, f.metadata = $metadata "
     "RETURN f"
 )
 
@@ -181,7 +182,7 @@ CYPHER_BULK_MERGE_FACTS = (
     "n.relation_type = f.relation_type, n.object_id = f.object_id, "
     "n.object_label = f.object_label, n.valid_from = f.valid_from, "
     "n.valid_to = f.valid_to, n.source = f.source, n.confidence = f.confidence, "
-    "n.family_key = f.family_key "
+    "n.family_key = f.family_key, n.metadata = f.metadata "
     "RETURN count(n) AS imported"
 )
 
@@ -460,13 +461,13 @@ class Neo4jClient:
         subject = BiomedicalEntity(
             id=props.get("subject_id", ""),
             label=props.get("subject_label", ""),
-            entity_type="",
+            entity_type=props.get("subject_entity_type", "unknown"),
             canonical_id=props.get("subject_id", ""),
         )
         obj = BiomedicalEntity(
             id=props.get("object_id", ""),
             label=props.get("object_label", ""),
-            entity_type="",
+            entity_type=props.get("object_entity_type", "unknown"),
             canonical_id=props.get("object_id", ""),
         )
 
@@ -476,6 +477,18 @@ class Neo4jClient:
             if valid_to_raw is not None
             else None
         )
+
+        # Deserialize metadata from JSON string
+        metadata_raw = props.get("metadata", "{}")
+        if isinstance(metadata_raw, str):
+            try:
+                metadata = json.loads(metadata_raw)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        elif isinstance(metadata_raw, dict):
+            metadata = metadata_raw
+        else:
+            metadata = {}
 
         return Fact(
             subject=subject,
@@ -487,6 +500,7 @@ class Neo4jClient:
             ),
             source=props.get("source", ""),
             confidence=float(props.get("confidence", 1.0)),
+            metadata=metadata,
         )
 
     # --- Schema / index creation ---------------------------------------------
@@ -829,7 +843,14 @@ class Neo4jClient:
         cypher = self._format_cypher(CYPHER_FACT_HISTORY)
         results = self._execute_with_retry(cypher, {"family_key": family_key})
 
-        return [self._neo4j_node_to_fact(r["f"]) for r in results]
+        facts = [self._neo4j_node_to_fact(r["f"]) for r in results]
+
+        # Populate version_chain on each fact with the full lineage
+        chain_ids = [f.fact_id for f in facts]
+        for fact in facts:
+            fact.version_chain = chain_ids
+
+        return facts
 
     # --- Bulk operations -----------------------------------------------------
 

@@ -11,6 +11,7 @@ Tests:
 """
 
 import hashlib
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -425,6 +426,11 @@ class TestNeo4jClientConstruction:
         assert "Fct" in result
         assert "HAS_FACT" in result
 
+    def test_cypher_create_fact_includes_metadata(self) -> None:
+        from src.kg.neo4j_client import CYPHER_CREATE_FACT, CYPHER_BULK_MERGE_FACTS
+        assert "metadata" in CYPHER_CREATE_FACT
+        assert "metadata" in CYPHER_BULK_MERGE_FACTS
+
 
 # ===========================================================================
 # Neo4j client — mocked CRUD operations
@@ -524,6 +530,50 @@ class TestNeo4jClientCRUD:
     def test_temporal_filter_at_timestamp_missing(self, mock_client: Neo4jClient) -> None:
         with pytest.raises(ValueError, match="timestamp is required"):
             Neo4jClient._apply_temporal_filter([], "AT_TIMESTAMP")
+
+    def test_neo4j_node_to_fact_with_metadata(self, mock_client: Neo4jClient) -> None:
+        """Verify metadata is deserialized from JSON string."""
+        node = {
+            "fact_id": "abc123",
+            "subject_id": "C0001",
+            "subject_label": "Drug-A",
+            "relation_type": "TREATS",
+            "object_id": "C0002",
+            "object_label": "Disease-B",
+            "valid_from": "2024-01-01",
+            "valid_to": None,
+            "source": "PMID:12345",
+            "confidence": 0.95,
+            "metadata": json.dumps({"evidence": "some text", "model": "claude"}),
+        }
+        fact = mock_client._neo4j_node_to_fact(node)
+        assert fact.metadata == {"evidence": "some text", "model": "claude"}
+
+    def test_neo4j_node_to_fact_missing_metadata(self, mock_client: Neo4jClient) -> None:
+        """Verify missing metadata defaults to empty dict."""
+        node = {
+            "fact_id": "abc123",
+            "subject_id": "C0001",
+            "subject_label": "Drug-A",
+            "relation_type": "TREATS",
+            "object_id": "C0002",
+            "object_label": "Disease-B",
+            "valid_from": "2024-01-01",
+            "valid_to": None,
+            "source": "PMID:12345",
+            "confidence": 0.95,
+        }
+        fact = mock_client._neo4j_node_to_fact(node)
+        assert fact.metadata == {}
+
+    def test_fact_properties_include_metadata(self) -> None:
+        """Verify to_neo4j_properties includes metadata for Cypher params."""
+        fact = _fact()
+        props = fact.to_neo4j_properties()
+        assert "metadata" in props
+        assert isinstance(props["metadata"], str)
+        parsed = json.loads(props["metadata"])
+        assert isinstance(parsed, dict)
 
 
 # ===========================================================================
