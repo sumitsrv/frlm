@@ -83,6 +83,32 @@ train-all: train-router train-retrieval train-joint ## Run all three training ph
 	@echo "All training phases complete."
 
 # ---------------------------------------------------------------------------
+# Full pipeline orchestration
+# ---------------------------------------------------------------------------
+
+STEP ?= 1
+
+.PHONY: full-pipeline
+full-pipeline: ## Run entire 11-step pipeline end-to-end
+	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --yes
+
+.PHONY: resume
+resume: ## Resume pipeline from step STEP (e.g. make resume STEP=7)
+	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --start-from $(STEP) --yes
+
+.PHONY: dry-run
+dry-run: ## Dry-run: print pipeline commands without executing
+	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --dry-run
+
+.PHONY: status
+status: ## Show pipeline completion status (which steps have outputs)
+	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --status
+
+.PHONY: estimate-costs
+estimate-costs: ## Print estimated resource costs for the full pipeline
+	$(PYTHON) scripts/estimate_costs.py --config $(CONFIG)
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
