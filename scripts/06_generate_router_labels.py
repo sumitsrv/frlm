@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-06_generate_router_labels.py - Generate router training labels using Claude API.
+06_generate_router_labels.py — Generate router training labels using Claude API.
 
-Labels text spans as RETRIEVAL (factual claims) or GENERATION (linguistic glue)
-using Claude. Includes label quality validation and inter-annotator agreement.
+Labels text spans as **factual** (retrieval) or **linguistic** (generation)
+using the :class:`LLMLabeler`.  Validates quality with :class:`LabelValidator`
+and exports statistics + Label-Studio-formatted review files.
 
 Pipeline position: Step 6 of 11
-Reads from:  config.paths.processed_dir (chunked text)
-Writes to:   config.paths.labels_dir (label JSON)
+Reads from:  config.paths.processed_dir  (chunked text JSON)
+Writes to:   config.paths.labels_dir     (label JSON, statistics, LS export)
 Config used: config.labeling, config.paths
 """
 
@@ -19,142 +20,104 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config.config import FRLMConfig, load_config, setup_logging
+from src.labeling.llm_labeler import LLMLabeler, SpanLabel
+from src.labeling.label_validator import LabelValidator
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Corpus loading helpers
+# ---------------------------------------------------------------------------
+
+
 def _discover_chunks(processed_dir: Path) -> List[Path]:
-    """Find all processed text chunk files ready for labeling."""
-    patterns = ["entities_*.json"]
-    files = []
+    """Find all processed text-chunk files ready for labeling.
+
+    Looks for ``chunks_*.json`` and ``entities_*.json`` files produced by
+    earlier pipeline stages.
+    """
+    patterns = ["chunks_*.json", "entities_*.json"]
+    files: List[Path] = []
     for pattern in patterns:
         files.extend(sorted(processed_dir.glob(pattern)))
     logger.info("Found %d chunk files in %s", len(files), processed_dir)
     return files
 
 
-def _call_labeling_api(
-    chunks: List[str],
-    labeling_cfg: Any,
-) -> List[Dict[str, Any]]:
-    """Call Claude API to label text spans as RETRIEVAL or GENERATION.
+def _load_texts_from_file(path: Path) -> List[str]:
+    """Extract text strings from a processed-chunk JSON file.
 
-    Returns list of label dicts with character offsets.
+    Supports two layouts:
+    * A JSON list of objects each containing a ``"text"`` key.
+    * A single JSON object with a ``"text"`` key.
     """
-    for attempt in range(1, labeling_cfg.max_retries + 1):
-        try:
-            logger.debug(
-                "Labeling API call (attempt %d/%d, %d chunks)",
-                attempt, labeling_cfg.max_retries, len(chunks),
-            )
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
 
-            # Production:
-            #   import anthropic
-            #   client = anthropic.Anthropic(api_key=labeling_cfg.api_key)
-            #   text_block = "\n---\n".join(chunks)
-            #   response = client.messages.create(
-            #       model=labeling_cfg.model,
-            #       max_tokens=labeling_cfg.max_tokens,
-            #       temperature=labeling_cfg.temperature,
-            #       system=labeling_cfg.system_prompt,
-            #       messages=[{"role": "user", "content": f"Label the following text:\n\n{text_block}"}],
-            #   )
-            #   return json.loads(response.content[0].text)
-
-            logger.debug("Would label %d chunks via Claude %s", len(chunks), labeling_cfg.model)
-            return []
-
-        except Exception as exc:
-            logger.warning("Labeling API call failed (attempt %d): %s", attempt, exc)
-            if attempt < labeling_cfg.max_retries:
-                time.sleep(labeling_cfg.retry_delay * attempt)
-
-    logger.error("All labeling API attempts exhausted")
+    if isinstance(data, list):
+        return [item.get("text", "") for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        return [data.get("text", "")]
     return []
 
 
-def _validate_labels(
-    labels: List[Dict[str, Any]],
-    text_length: int,
-    validation_cfg: Any,
-) -> Tuple[bool, List[str]]:
-    """Validate label quality against configured thresholds.
+# ---------------------------------------------------------------------------
+# Cost estimation
+# ---------------------------------------------------------------------------
 
-    Returns (is_valid, list_of_issues).
+
+def estimate_cost(
+    total_texts: int,
+    avg_text_length: int,
+    cfg_labeling: Any,
+) -> Dict[str, Any]:
+    """Estimate total Claude API cost for a labeling run.
+
+    Rough heuristic: ~1 token ≈ 4 chars for input;
+    output ≈ 25 % of input tokens.
     """
-    issues: List[str] = []
+    avg_input_tokens = avg_text_length / 4   # text tokens
+    avg_input_tokens += 800                   # system + few-shot prompt overhead
+    avg_output_tokens = avg_input_tokens * 0.25
 
-    if not labels:
-        issues.append("No labels produced")
-        return False, issues
+    total_input = int(avg_input_tokens * total_texts)
+    total_output = int(avg_output_tokens * total_texts)
 
-    num_spans = len(labels)
-    if num_spans < validation_cfg.min_spans_per_chunk:
-        issues.append(f"Too few spans: {num_spans} < {validation_cfg.min_spans_per_chunk}")
-    if num_spans > validation_cfg.max_spans_per_chunk:
-        issues.append(f"Too many spans: {num_spans} > {validation_cfg.max_spans_per_chunk}")
+    input_cost = total_input * 3.00 / 1_000_000
+    output_cost = total_output * 15.00 / 1_000_000
+    total_cost = input_cost + output_cost
 
-    retrieval_chars = sum(
-        (l.get("end", 0) - l.get("start", 0))
-        for l in labels
-        if l.get("label") == "RETRIEVAL"
-    )
-    if text_length > 0:
-        ratio = retrieval_chars / text_length
-        if ratio < validation_cfg.min_retrieval_ratio:
-            issues.append(f"Retrieval ratio too low: {ratio:.3f} < {validation_cfg.min_retrieval_ratio}")
-        if ratio > validation_cfg.max_retrieval_ratio:
-            issues.append(f"Retrieval ratio too high: {ratio:.3f} > {validation_cfg.max_retrieval_ratio}")
-
-    is_valid = len(issues) == 0
-    return is_valid, issues
+    return {
+        "total_texts": total_texts,
+        "avg_text_length_chars": avg_text_length,
+        "estimated_input_tokens": total_input,
+        "estimated_output_tokens": total_output,
+        "estimated_cost_usd": round(total_cost, 2),
+        "model": cfg_labeling.model,
+    }
 
 
-def _compute_inter_annotator_agreement(
-    labels_a: List[Dict[str, Any]],
-    labels_b: List[Dict[str, Any]],
-    text_length: int,
-) -> float:
-    """Compute Cohen's kappa between two label sets at character level."""
-    if text_length == 0:
-        return 0.0
-
-    # Build character-level arrays
-    arr_a = [0] * text_length
-    arr_b = [0] * text_length
-
-    for l in labels_a:
-        for i in range(l.get("start", 0), min(l.get("end", 0), text_length)):
-            if l.get("label") == "RETRIEVAL":
-                arr_a[i] = 1
-
-    for l in labels_b:
-        for i in range(l.get("start", 0), min(l.get("end", 0), text_length)):
-            if l.get("label") == "RETRIEVAL":
-                arr_b[i] = 1
-
-    # Cohen's kappa
-    n = text_length
-    agreement = sum(1 for a, b in zip(arr_a, arr_b) if a == b)
-    p_o = agreement / n
-
-    p_a_1 = sum(arr_a) / n
-    p_b_1 = sum(arr_b) / n
-    p_e = p_a_1 * p_b_1 + (1 - p_a_1) * (1 - p_b_1)
-
-    if abs(1 - p_e) < 1e-10:
-        return 1.0 if abs(p_o - 1.0) < 1e-10 else 0.0
-
-    kappa = (p_o - p_e) / (1 - p_e)
-    return kappa
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 
-def generate_labels(cfg: FRLMConfig) -> None:
-    """Orchestrate label generation across all processed chunks."""
+def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None:
+    """Orchestrate label generation across all processed chunks.
+
+    Steps:
+    1. Discover chunk files in ``processed_dir``.
+    2. For each file, extract texts and label via :class:`LLMLabeler`.
+    3. Validate each labelled set with :class:`LabelValidator`.
+    4. Save per-file labels + per-corpus statistics.
+    5. Export low-confidence spans in Label-Studio format for human review.
+    """
     labeling_cfg = cfg.labeling
     processed_dir = cfg.paths.resolve("processed_dir")
     labels_dir = cfg.paths.resolve("labels_dir")
@@ -163,56 +126,109 @@ def generate_labels(cfg: FRLMConfig) -> None:
     logger.info("=== Router Label Generation (Claude API) ===")
     logger.info("Model: %s", labeling_cfg.model)
     logger.info("Batch size: %d chunks per call", labeling_cfg.batch_size)
-    logger.info("IAA samples: %d, Min kappa: %.2f",
-                labeling_cfg.inter_annotator_samples, labeling_cfg.min_agreement_threshold)
+    logger.info(
+        "IAA samples: %d, Min kappa: %.2f",
+        labeling_cfg.inter_annotator_samples,
+        labeling_cfg.min_agreement_threshold,
+    )
 
+    # -- 1. Discover chunk files -----------------------------------------
     chunk_files = _discover_chunks(processed_dir)
     if not chunk_files:
-        logger.warning("No chunk files found. Run step 02 first.")
+        logger.warning("No chunk files found in %s. Run step 02 first.", processed_dir)
         return
+    if max_files is not None:
+        chunk_files = chunk_files[:max_files]
+        logger.info("Limiting to %d files (--max-files)", max_files)
+
+    # -- 2. Cost estimate ------------------------------------------------
+    sample_texts: List[str] = []
+    for cf in chunk_files[:10]:
+        sample_texts.extend(_load_texts_from_file(cf))
+    if sample_texts:
+        avg_len = sum(len(t) for t in sample_texts) // max(len(sample_texts), 1)
+        total_count = sum(
+            len(_load_texts_from_file(cf)) for cf in chunk_files
+        )
+        cost_est = estimate_cost(total_count, avg_len, labeling_cfg)
+        logger.info("Cost estimate: %s", json.dumps(cost_est, indent=2))
+        est_path = labels_dir / "cost_estimate.json"
+        with open(est_path, "w") as fh:
+            json.dump(cost_est, fh, indent=2)
+
+    # -- 3. Label each file ----------------------------------------------
+    labeler = LLMLabeler.from_config(labeling_cfg)
+    validator = LabelValidator()
 
     start_time = time.time()
     total_labeled = 0
     total_valid = 0
     total_invalid = 0
+    all_spans: List[SpanLabel] = []
+    review_records: List[Dict[str, Any]] = []
 
-    for idx, chunk_path in enumerate(chunk_files, start=1):
-        label_filename = chunk_path.name.replace("entities_", "labels_")
+    for file_idx, chunk_path in enumerate(chunk_files, start=1):
+        label_filename = chunk_path.stem.replace("entities_", "labels_").replace(
+            "chunks_", "labels_"
+        ) + ".json"
         label_path = labels_dir / label_filename
 
+        # Resume: skip already-labelled files
         if label_path.exists():
-            logger.debug("Skipping already labeled: %s", chunk_path.name)
+            logger.debug("Skipping already labelled: %s", chunk_path.name)
             continue
 
         try:
-            with open(chunk_path, "r", encoding="utf-8") as fh:
-                entities = json.load(fh)
+            texts = _load_texts_from_file(chunk_path)
+            file_spans: List[SpanLabel] = []
 
-            chunks = [e.get("text", "") for e in (entities if isinstance(entities, list) else [entities])]
-            batch_size = labeling_cfg.batch_size
-
-            all_labels: List[Dict[str, Any]] = []
-            for i in range(0, max(len(chunks), 1), batch_size):
-                batch = chunks[i : i + batch_size]
-                labels = _call_labeling_api(batch, labeling_cfg)
-                all_labels.extend(labels)
+            for text in texts:
+                if not text.strip():
+                    continue
+                try:
+                    spans = labeler.label_text(text)
+                except Exception as exc:
+                    logger.error(
+                        "Labeling failed for text in %s: %s",
+                        chunk_path.name, exc,
+                    )
+                    spans = []
+                file_spans.extend(spans)
+                all_spans.extend(spans)
 
             # Validate
-            text_length = sum(len(c) for c in chunks)
-            is_valid, issues = _validate_labels(all_labels, text_length, labeling_cfg.validation)
+            text_length = sum(len(t) for t in texts)
+            vcfg = labeling_cfg.validation
+            is_valid, issues = validator.validate_labels(
+                file_spans,
+                text_length,
+                min_retrieval_ratio=vcfg.min_retrieval_ratio,
+                max_retrieval_ratio=vcfg.max_retrieval_ratio,
+                min_spans_per_chunk=vcfg.min_spans_per_chunk,
+                max_spans_per_chunk=vcfg.max_spans_per_chunk,
+            )
 
             if not is_valid:
-                logger.warning("Label validation failed for %s: %s", chunk_path.name, issues)
+                logger.warning(
+                    "Validation failed for %s: %s", chunk_path.name, issues
+                )
                 total_invalid += 1
             else:
                 total_valid += 1
 
-            total_labeled += len(all_labels)
+            total_labeled += len(file_spans)
 
-            # Save labels
+            # Collect low-confidence for review
+            low_conf = validator.find_low_confidence(file_spans, threshold=0.7)
+            if low_conf:
+                for t in texts:
+                    review_records.append({"text": t, "spans": low_conf})
+
+            # Save per-file labels atomically
             output = {
                 "source_file": chunk_path.name,
-                "labels": all_labels,
+                "spans": [s.model_dump() for s in file_spans],
+                "num_spans": len(file_spans),
                 "valid": is_valid,
                 "issues": issues,
             }
@@ -224,26 +240,106 @@ def generate_labels(cfg: FRLMConfig) -> None:
         except (json.JSONDecodeError, OSError) as exc:
             logger.error("Failed to process %s: %s", chunk_path.name, exc)
 
-        if idx % 10 == 0 or idx == len(chunk_files):
-            logger.info("Labeling progress: %d/%d files, %d labels, %d valid, %d invalid",
-                        idx, len(chunk_files), total_labeled, total_valid, total_invalid)
+        if file_idx % 10 == 0 or file_idx == len(chunk_files):
+            logger.info(
+                "Progress: %d/%d files, %d spans, %d valid, %d invalid, cost $%.4f",
+                file_idx,
+                len(chunk_files),
+                total_labeled,
+                total_valid,
+                total_invalid,
+                labeler.cost_tracker.estimated_cost_usd,
+            )
 
-    total_time = time.time() - start_time
+    elapsed = time.time() - start_time
+
+    # -- 4. Corpus-level statistics --------------------------------------
+    stats = validator.compute_statistics(all_spans)
+    stats["elapsed_seconds"] = round(elapsed, 2)
+    stats["files_total"] = len(chunk_files)
+    stats["files_valid"] = total_valid
+    stats["files_invalid"] = total_invalid
+    stats["cost"] = labeler.cost_tracker.summary()
+
+    stats_path = labels_dir / "label_statistics.json"
+    with open(stats_path, "w") as fh:
+        json.dump(stats, fh, indent=2)
+    logger.info("Statistics written to %s", stats_path)
+
+    # -- 5. Export low-confidence spans for human review -----------------
+    if review_records:
+        review_path = labels_dir / "review_export.json"
+        validator.export_corpus_for_review(review_records, review_path)
+        logger.info("Exported %d review records to %s", len(review_records), review_path)
+
+    # -- Summary ---------------------------------------------------------
     logger.info("=== Label Generation Summary ===")
-    logger.info("Files: %d, Labels: %d, Valid: %d, Invalid: %d, Time: %.2fs",
-                len(chunk_files), total_labeled, total_valid, total_invalid, total_time)
+    logger.info(
+        "Files: %d | Spans: %d | Valid: %d | Invalid: %d | Time: %.1fs | Cost: $%.4f",
+        len(chunk_files),
+        total_labeled,
+        total_valid,
+        total_invalid,
+        elapsed,
+        labeler.cost_tracker.estimated_cost_usd,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validate-only mode
+# ---------------------------------------------------------------------------
+
+
+def validate_existing(cfg: FRLMConfig) -> None:
+    """Re-validate existing labels without calling the API."""
+    labels_dir = cfg.paths.resolve("labels_dir")
+    if not labels_dir.exists():
+        logger.error("Labels directory does not exist: %s", labels_dir)
+        return
+
+    validator = LabelValidator()
+    label_files = sorted(labels_dir.glob("labels_*.json"))
+    logger.info("Re-validating %d label files in %s", len(label_files), labels_dir)
+
+    all_spans: List[SpanLabel] = []
+    for lf in label_files:
+        with open(lf) as fh:
+            data = json.load(fh)
+        spans = [SpanLabel(**s) for s in data.get("spans", [])]
+        all_spans.extend(spans)
+
+    stats = validator.compute_statistics(all_spans)
+    low = validator.find_low_confidence(all_spans, threshold=0.7)
+    stats["low_confidence_count"] = len(low)
+
+    stats_path = labels_dir / "label_statistics.json"
+    with open(stats_path, "w") as fh:
+        json.dump(stats, fh, indent=2)
+
+    logger.info("Validation complete — %d spans, %d low-confidence", len(all_spans), len(low))
+    logger.info("Statistics: %s", json.dumps(stats, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    """Parse arguments, load config, and generate router labels."""
+    """Parse arguments, load config, and run."""
     parser = argparse.ArgumentParser(
         description="Generate router training labels using Claude API.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--config", type=str, default="config/default.yaml")
-    parser.add_argument("--max-files", type=int, default=None)
-    parser.add_argument("--validate-only", action="store_true",
-                        help="Only validate existing labels without generating new ones.")
+    parser.add_argument(
+        "--max-files", type=int, default=None,
+        help="Limit the number of chunk files to process.",
+    )
+    parser.add_argument(
+        "--validate-only", action="store_true",
+        help="Only validate existing labels without generating new ones.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -251,7 +347,10 @@ def main() -> None:
     logger.info("Starting 06_generate_router_labels with config: %s", args.config)
 
     try:
-        generate_labels(cfg)
+        if args.validate_only:
+            validate_existing(cfg)
+        else:
+            generate_labels(cfg, max_files=args.max_files)
     except KeyboardInterrupt:
         logger.warning("Label generation interrupted.")
         sys.exit(130)
