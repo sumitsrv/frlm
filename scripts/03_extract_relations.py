@@ -108,25 +108,16 @@ def _call_claude_api(
                 relation_cfg.model,
             )
 
-            # Production implementation:
-            #   import anthropic
-            #   client = anthropic.Anthropic(api_key=relation_cfg.api_key)
-            #   response = client.messages.create(
-            #       model=relation_cfg.model,
-            #       max_tokens=relation_cfg.max_tokens,
-            #       temperature=relation_cfg.temperature,
-            #       system=prompt["system"],
-            #       messages=[{"role": "user", "content": prompt["user"]}],
-            #   )
-            #   return json.loads(response.content[0].text)
-
-            logger.debug(
-                "Would send to Claude %s (max_tokens=%d, temp=%.1f)",
-                relation_cfg.model,
-                relation_cfg.max_tokens,
-                relation_cfg.temperature,
+            import anthropic
+            client = anthropic.Anthropic(api_key=relation_cfg.api_key)
+            response = client.messages.create(
+                model=relation_cfg.model,
+                max_tokens=relation_cfg.max_tokens,
+                temperature=relation_cfg.temperature,
+                system=prompt["system"],
+                messages=[{"role": "user", "content": prompt["user"]}],
             )
-            return []
+            return json.loads(response.content[0].text)
 
         except json.JSONDecodeError:
             logger.warning(

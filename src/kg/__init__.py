@@ -16,6 +16,7 @@ from src.kg.schema import (
     compute_fact_id,
 )
 from src.kg.neo4j_client import Neo4jClient
+from src.kg.populator import KGPopulator
 from src.kg.temporal import TemporalResolver
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "ClusterType",
     "Fact",
     "FactCluster",
+    "KGPopulator",
     "Relation",
     "RelationType",
     "TemporalEnvelope",

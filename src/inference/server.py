@@ -460,3 +460,56 @@ def create_app(
         request_timeout,
     )
     return app
+
+
+# ===========================================================================
+# CLI entry point
+# ===========================================================================
+
+
+def main() -> None:
+    """Launch the FRLM inference server via uvicorn.
+
+    This is the entry point referenced by ``setup.py`` console_scripts
+    (``frlm-server = src.inference.server:main``).
+    """
+    import argparse
+
+    import uvicorn
+
+    from config.config import load_config, setup_logging
+
+    parser = argparse.ArgumentParser(
+        description="FRLM Inference Server",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", type=str, default="config/default.yaml",
+                        help="Path to FRLM config YAML.")
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+                        help="Bind host.")
+    parser.add_argument("--port", type=int, default=8000,
+                        help="Bind port.")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of uvicorn workers.")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    setup_logging(cfg)
+
+    app = create_app(config=cfg)
+
+    logger.info(
+        "Starting FRLM server on %s:%d (workers=%d)",
+        args.host, args.port, args.workers,
+    )
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        workers=args.workers,
+        log_level="info",
+    )
+
+
+if __name__ == "__main__":
+    main()

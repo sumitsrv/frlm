@@ -54,8 +54,8 @@ def _create_schema_constraints(driver: Any, neo4j_cfg: Any) -> None:
     logger.info("Creating %d schema constraints/indexes", len(constraints))
     for cypher in constraints:
         logger.debug("Executing: %s", cypher[:120])
-        # Production: with driver.session(database=neo4j_cfg.database) as session:
-        #     session.run(cypher)
+        with driver.session(database=neo4j_cfg.database) as session:
+            session.run(cypher)
 
 
 def _load_extraction_data(
@@ -104,8 +104,8 @@ def _import_entities_batch(
             f"THEN e.confidence ELSE n.confidence END"
         )
         logger.debug("Entity batch %d-%d of %d", i + 1, min(i + batch_size, len(entities)), len(entities))
-        # Production: with driver.session(database=neo4j_cfg.database) as session:
-        #     session.run(cypher, {"entities": batch})
+        with driver.session(database=neo4j_cfg.database) as session:
+            session.run(cypher, {"entities": batch})
         imported += len(batch)
 
     return imported
@@ -140,8 +140,8 @@ def _import_relations_batch(
             f"f.valid_to = r.valid_to"
         )
         logger.debug("Relation batch %d-%d of %d", i + 1, min(i + batch_size, len(relations)), len(relations))
-        # Production: with driver.session(database=neo4j_cfg.database) as session:
-        #     session.run(cypher, {"relations": batch})
+        with driver.session(database=neo4j_cfg.database) as session:
+            session.run(cypher, {"relations": batch})
         imported += len(batch)
 
     return imported
@@ -159,10 +159,9 @@ def _build_version_chains(driver: Any, neo4j_cfg: Any) -> int:
         f"RETURN count(*) AS chains_created"
     )
     logger.info("Building version chains (%s edges)", schema.version_chain_type)
-    # Production: with driver.session(database=neo4j_cfg.database) as session:
-    #     result = session.run(cypher)
-    #     return result.single()["chains_created"]
-    return 0
+    with driver.session(database=neo4j_cfg.database) as session:
+        result = session.run(cypher)
+        return result.single()["chains_created"]
 
 
 def populate_kg(cfg: FRLMConfig) -> None:
@@ -174,9 +173,8 @@ def populate_kg(cfg: FRLMConfig) -> None:
     logger.info("URI: %s, Database: %s", neo4j_cfg.uri, neo4j_cfg.database)
     logger.info("Batch size: %d", neo4j_cfg.batch.import_batch_size)
 
-    # Production: from neo4j import GraphDatabase
-    # driver = GraphDatabase.driver(neo4j_cfg.uri, auth=(neo4j_cfg.username, neo4j_cfg.password))
-    driver = None
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver(neo4j_cfg.uri, auth=(neo4j_cfg.username, neo4j_cfg.password))
 
     try:
         _create_schema_constraints(driver, neo4j_cfg)

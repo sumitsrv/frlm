@@ -258,6 +258,7 @@ class FRLMModel(nn.Module):
         attention_mask: Optional[Tensor] = None,
         faiss_index: Any = None,
         kg_client: Any = None,
+        tokenizer: Any = None,
         max_length: int = 256,
         temperature: float = 1.0,
         top_k: int = 50,
@@ -280,6 +281,10 @@ class FRLMModel(nn.Module):
             Vector index for retrieval.
         kg_client : Neo4jClient, optional
             KG client for temporal resolution.
+        tokenizer : PreTrainedTokenizer, optional
+            Tokenizer for encoding retrieved fact text into token ids.
+            When provided, retrieved facts are injected into the token
+            stream; otherwise they are only recorded.
         max_length : int
             Maximum output sequence length.
         temperature : float
@@ -326,8 +331,44 @@ class FRLMModel(nn.Module):
                     query_sig, faiss_index, kg_client, top_k=retrieval_top_k,
                 )
                 retrieved_facts.append(facts)
-                # In a full implementation we'd tokenise the fact text and
-                # append to the sequence. For now we just record the retrieval.
+
+                # Tokenise retrieved fact text and inject into the sequence
+                if facts and tokenizer is not None:
+                    # Build a fact string: "subject relation object"
+                    fact = facts[0]  # use top-1 retrieved fact
+                    if isinstance(fact, dict):
+                        fact_text = " ".join([
+                            str(fact.get("subject", "")),
+                            str(fact.get("relation", "")),
+                            str(fact.get("object", "")),
+                        ]).strip()
+                    elif hasattr(fact, "subject") and hasattr(fact, "object"):
+                        subj = getattr(fact.subject, "label", str(fact.subject))
+                        rel = getattr(fact.relation, "type", str(fact.relation))
+                        obj = getattr(fact.object, "label", str(fact.object))
+                        fact_text = f"{subj} {rel} {obj}"
+                    else:
+                        fact_text = str(fact)
+
+                    if fact_text:
+                        fact_tokens = tokenizer.encode(
+                            fact_text, add_special_tokens=False
+                        )
+                        fact_ids = torch.tensor(
+                            [fact_tokens], dtype=torch.long, device=device,
+                        )
+                        generated = torch.cat([generated, fact_ids], dim=1)
+                        attention_mask = torch.cat(
+                            [
+                                attention_mask,
+                                torch.ones(
+                                    1, len(fact_tokens),
+                                    device=device,
+                                    dtype=attention_mask.dtype,
+                                ),
+                            ],
+                            dim=1,
+                        )
             else:
                 router_decisions.append("generation")
                 logits = self.generation_head.forward(last_hidden)  # (1, 1, vocab)

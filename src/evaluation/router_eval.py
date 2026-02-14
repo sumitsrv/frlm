@@ -572,3 +572,145 @@ class RouterEvaluator:
                     )
 
         return analysis
+
+
+# ===========================================================================
+# Visualization helpers
+# ===========================================================================
+
+
+def plot_confusion_matrix(
+    cm: ConfusionMatrix,
+    title: str = "Router Confusion Matrix",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (6, 5),
+) -> Any:
+    """Plot a 2×2 confusion matrix heatmap with matplotlib/seaborn.
+
+    Parameters
+    ----------
+    cm : ConfusionMatrix
+        Computed confusion matrix.
+    title : str
+        Plot title.
+    save_path : str, optional
+        If given, save the figure to this path (PNG/PDF).
+    figsize : tuple
+        Figure size in inches.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure object (for further customisation).
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        logger.warning(
+            "matplotlib/seaborn not installed — skipping confusion matrix plot"
+        )
+        return None
+
+    matrix = np.array(cm.to_matrix())  # [[TN, FP], [FN, TP]]
+    labels = np.array([
+        [f"TN\n{matrix[0, 0]}", f"FP\n{matrix[0, 1]}"],
+        [f"FN\n{matrix[1, 0]}", f"TP\n{matrix[1, 1]}"],
+    ])
+
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        matrix,
+        annot=labels,
+        fmt="",
+        cmap="Blues",
+        xticklabels=["Predicted\nGeneration", "Predicted\nRetrieval"],
+        yticklabels=["Actual\nGeneration", "Actual\nRetrieval"],
+        cbar_kws={"label": "Count"},
+        ax=ax,
+    )
+    ax.set_title(title)
+    ax.set_ylabel("Actual")
+    ax.set_xlabel("Predicted")
+
+    # Add summary metrics as text below the plot
+    summary = (
+        f"Accuracy={cm.accuracy:.3f}  Precision={cm.precision:.3f}  "
+        f"Recall={cm.recall:.3f}  F1={cm.f1:.3f}"
+    )
+    fig.text(0.5, 0.01, summary, ha="center", fontsize=9, style="italic")
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        logger.info("Confusion matrix saved to %s", save_path)
+
+    return fig
+
+
+def plot_threshold_sweep(
+    results: Sequence[ThresholdResult],
+    title: str = "Router Threshold Sweep",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (8, 5),
+) -> Any:
+    """Plot precision, recall, F1, and accuracy across router thresholds.
+
+    Parameters
+    ----------
+    results : list[ThresholdResult]
+        Output from :meth:`RouterEvaluator.threshold_sweep`.
+    title : str
+        Plot title.
+    save_path : str, optional
+        If given, save the figure to this path.
+    figsize : tuple
+        Figure size in inches.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The figure object.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not installed — skipping threshold sweep plot")
+        return None
+
+    thresholds = [r.threshold for r in results]
+    accuracies = [r.accuracy for r in results]
+    precisions = [r.precision for r in results]
+    recalls = [r.recall for r in results]
+    f1s = [r.f1 for r in results]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(thresholds, accuracies, label="Accuracy", marker=".", linewidth=1.5)
+    ax.plot(thresholds, precisions, label="Precision", marker=".", linewidth=1.5)
+    ax.plot(thresholds, recalls, label="Recall", marker=".", linewidth=1.5)
+    ax.plot(thresholds, f1s, label="F1", marker=".", linewidth=2)
+
+    # Mark the best F1 point
+    best_idx = int(np.argmax(f1s))
+    ax.axvline(
+        thresholds[best_idx],
+        color="red",
+        linestyle="--",
+        alpha=0.6,
+        label=f"Best F1={f1s[best_idx]:.3f} @ τ={thresholds[best_idx]:.2f}",
+    )
+
+    ax.set_xlabel("Router Threshold (τ)")
+    ax.set_ylabel("Score")
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        logger.info("Threshold sweep plot saved to %s", save_path)
+
+    return fig
