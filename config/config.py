@@ -349,7 +349,7 @@ class EntityExtractionConfig(BaseModel):
 class RelationExtractionConfig(BaseModel):
     """Claude API relation extraction configuration."""
 
-    model: str = "claude-sonnet-4-5-20250929"
+    model: str = "claude-sonnet-4-6"
     api_key: str = "CHANGE_ME"
     max_tokens: int = 4096
     temperature: float = 0.0
@@ -412,7 +412,7 @@ class LabelValidationConfig(BaseModel):
 class LabelingConfig(BaseModel):
     """Claude API labeling configuration."""
 
-    model: str = "claude-sonnet-4-5-20250929"
+    model: str = "claude-sonnet-4-6"
     api_key: str = "CHANGE_ME"
     max_tokens: int = 4096
     temperature: float = 0.0

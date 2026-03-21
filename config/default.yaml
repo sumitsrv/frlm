@@ -177,7 +177,7 @@ extraction:
 
   # Relation extraction — Claude API
   relation:
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-4-6"
     api_key: "CHANGE_ME"            # override with ANTHROPIC_API_KEY env var
     max_tokens: 4096
     temperature: 0.0
@@ -197,7 +197,7 @@ extraction:
   corpus:
     source: "pmc_oa"                # PubMed Central Open Access
     format: "xml"
-    max_documents: null              # null = no limit
+    max_documents: 100               # set to null for no limit; start small for dev
     filter_journals: []              # empty = all journals
     min_year: 2000
     max_year: null
@@ -214,7 +214,7 @@ extraction:
 # Labeling — Claude API for router training labels
 # -----------------------------------------------------------------------------
 labeling:
-  model: "claude-sonnet-4-5-20250929"
+  model: "claude-haiku-4-5-20251001"   # Haiku: much cheaper for simple labeling tasks
   api_key: "CHANGE_ME"              # override with ANTHROPIC_API_KEY env var
   max_tokens: 4096
   temperature: 0.0

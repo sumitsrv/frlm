@@ -566,7 +566,7 @@ class RelationExtractor:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-6",
         api_key: Optional[str] = None,
         max_tokens: int = 4096,
         temperature: float = 0.0,

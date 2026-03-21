@@ -76,17 +76,28 @@ def _parse_file_list(
 ) -> List[Dict[str, str]]:
     """Parse the OA file list CSV and apply configured filters.
 
-    Filters by journal, year range, and max document count.
+    The PMC OA file list has columns:
+      File, Article Citation, Accession ID, Last Updated, PMID, License
+
+    Year and journal are embedded in the "Article Citation" field, e.g.:
+      "Breast Cancer Res. 2001 Nov 9; 3(1):61-65"
+
+    We extract the year via regex and derive the journal as the text
+    before the first four-digit year.
 
     Returns a list of dicts with keys: path, journal, pmcid, year.
     """
     import csv
+    import re
 
     entries: List[Dict[str, str]] = []
     filter_journals = set(getattr(corpus_cfg, "filter_journals", []))
     min_year = getattr(corpus_cfg, "min_year", 2000)
     max_year = getattr(corpus_cfg, "max_year", None)
     max_docs = getattr(corpus_cfg, "max_documents", None)
+
+    # Pattern to find a four-digit year (1900–2099) in the citation string
+    year_pattern = re.compile(r"\b(19\d{2}|20\d{2})\b")
 
     logger.info(
         "Parsing file list: journals=%s, year_range=[%s, %s], max_docs=%s",
@@ -98,27 +109,36 @@ def _parse_file_list(
 
     with open(csv_path, "r", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        for row in reader:
-            year_str = row.get("Year", row.get("year", "0"))
-            try:
-                year = int(year_str)
-            except ValueError:
-                continue
 
+        for row in reader:
+            # --- Extract year and journal from Article Citation ----
+            citation = row.get("Article Citation", "")
+            year_match = year_pattern.search(citation)
+            if not year_match:
+                continue
+            year = int(year_match.group(1))
+
+            # Journal name is everything before the year in the citation
+            journal = citation[: year_match.start()].rstrip(". ")
+
+            # --- Apply filters ---
             if year < min_year:
                 continue
             if max_year is not None and year > max_year:
                 continue
-
-            journal = row.get("Journal Title", row.get("journal", ""))
             if filter_journals and journal not in filter_journals:
+                continue
+
+            file_path = row.get("File", "")
+            pmcid = row.get("Accession ID", "")
+            if not file_path or not pmcid:
                 continue
 
             entries.append(
                 {
-                    "path": row.get("File", row.get("file", "")),
+                    "path": file_path,
                     "journal": journal,
-                    "pmcid": row.get("Accession ID", row.get("pmcid", "")),
+                    "pmcid": pmcid,
                     "year": str(year),
                 }
             )
@@ -134,12 +154,18 @@ def _download_paper(
     entry: Dict[str, str],
     corpus_dir: Path,
 ) -> Optional[Path]:
-    """Download a single paper XML from PMC.
+    """Download a single paper from PMC and extract the XML.
+
+    PMC OA files are .tar.gz archives containing one or more XML files.
+    We download the archive, extract the first .nxml/.xml file, and remove
+    the archive.
 
     Uses atomic write (download to .tmp then rename) to handle interruptions.
 
-    Returns the final path on success, None on failure.
+    Returns the final XML path on success, None on failure.
     """
+    import tarfile
+
     relative_path = entry["path"]
     pmcid = entry["pmcid"]
     url = PMC_OA_BASE_URL + relative_path
@@ -149,16 +175,39 @@ def _download_paper(
         logger.debug("Already downloaded: %s", pmcid)
         return output_path
 
-    tmp_path = output_path.with_suffix(".xml.tmp")
+    tar_tmp = corpus_dir / f"{pmcid}.tar.gz.tmp"
     try:
-        urllib.request.urlretrieve(url, str(tmp_path))
-        tmp_path.replace(output_path)
+        urllib.request.urlretrieve(url, str(tar_tmp))
+
+        # Extract the XML/NXML file from the tarball
+        with tarfile.open(str(tar_tmp), "r:gz") as tf:
+            xml_member = None
+            for member in tf.getmembers():
+                if member.name.endswith(".nxml") or member.name.endswith(".xml"):
+                    xml_member = member
+                    break
+
+            if xml_member is None:
+                logger.warning("No XML found in archive for %s", pmcid)
+                return None
+
+            # Extract to a temp file then rename
+            xml_tmp = output_path.with_suffix(".xml.tmp")
+            with tf.extractfile(xml_member) as src, open(xml_tmp, "wb") as dst:
+                dst.write(src.read())
+            xml_tmp.replace(output_path)
+
         return output_path
     except Exception as exc:
         logger.warning("Failed to download %s: %s", pmcid, exc)
-        if tmp_path.exists():
-            tmp_path.unlink()
         return None
+    finally:
+        # Clean up the tarball
+        if tar_tmp.exists():
+            tar_tmp.unlink()
+        xml_tmp_path = output_path.with_suffix(".xml.tmp")
+        if xml_tmp_path.exists():
+            xml_tmp_path.unlink()
 
 
 def _verify_downloads(corpus_dir: Path, expected_count: int) -> Dict[str, int]:

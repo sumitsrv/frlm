@@ -231,7 +231,7 @@ class LLMLabeler:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = "claude-sonnet-4-6",
         api_key: str = "",
         max_tokens: int = 4096,
         temperature: float = 0.0,

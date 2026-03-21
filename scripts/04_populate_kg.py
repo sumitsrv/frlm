@@ -88,15 +88,31 @@ def _load_extraction_data(
 def _import_entities_batch(
     driver: Any, entities: List[Dict[str, Any]], neo4j_cfg: Any,
 ) -> int:
-    """Import entity nodes in batches using UNWIND."""
+    """Import entity nodes in batches using UNWIND.
+
+    Entities without a CUI get a content-hash fallback ID so they can
+    still be merged without null-property errors.
+    """
     schema = neo4j_cfg.graph_schema
     batch_size = neo4j_cfg.batch.import_batch_size
     imported = 0
+    skipped = 0
+
+    # Assign fallback CUI for entities that didn't link to UMLS
+    for ent in entities:
+        if not ent.get("cui"):
+            text = ent.get("text", "")
+            label = ent.get("label", "")
+            fallback = hashlib.sha256(f"{text}||{label}".encode("utf-8")).hexdigest()[:16]
+            ent["cui"] = f"NOCUI_{fallback}"
+            ent.setdefault("canonical_name", text)
 
     for i in range(0, len(entities), batch_size):
         batch = entities[i : i + batch_size]
+        # Extra safety: filter out any remaining null CUIs in Cypher
         cypher = (
             f"UNWIND $entities AS e "
+            f"WITH e WHERE e.cui IS NOT NULL "
             f"MERGE (n:{schema.entity_label} {{cui: e.cui}}) "
             f"ON CREATE SET n.canonical_name = e.canonical_name, "
             f"n.text = e.text, n.label = e.label, n.confidence = e.confidence "
@@ -107,6 +123,9 @@ def _import_entities_batch(
         with driver.session(database=neo4j_cfg.database) as session:
             session.run(cypher, {"entities": batch})
         imported += len(batch)
+
+    if skipped:
+        logger.warning("Skipped %d entities with null CUI", skipped)
 
     return imported
 
@@ -119,8 +138,19 @@ def _import_relations_batch(
     batch_size = neo4j_cfg.batch.import_batch_size
     imported = 0
 
-    for i in range(0, len(relations), batch_size):
-        batch = relations[i : i + batch_size]
+    # Filter out relations with missing subject/object/relation_type
+    valid_relations = [
+        r for r in relations
+        if r.get("subject") and r.get("object") and r.get("relation_type")
+    ]
+    if len(valid_relations) < len(relations):
+        logger.warning(
+            "Filtered out %d relations with missing subject/object/relation_type",
+            len(relations) - len(valid_relations),
+        )
+
+    for i in range(0, len(valid_relations), batch_size):
+        batch = valid_relations[i : i + batch_size]
         for rel in batch:
             rel["hash"] = _compute_fact_hash(
                 subject_id=rel.get("subject", ""),
@@ -133,13 +163,14 @@ def _import_relations_batch(
 
         cypher = (
             f"UNWIND $relations AS r "
+            f"WITH r WHERE r.hash IS NOT NULL "
             f"MERGE (f:{schema.fact_label} {{hash: r.hash}}) "
             f"ON CREATE SET f.subject = r.subject, f.relation_type = r.relation_type, "
             f"f.object = r.object, f.confidence = r.confidence, "
             f"f.evidence_span = r.evidence_span, f.valid_from = r.valid_from, "
             f"f.valid_to = r.valid_to"
         )
-        logger.debug("Relation batch %d-%d of %d", i + 1, min(i + batch_size, len(relations)), len(relations))
+        logger.debug("Relation batch %d-%d of %d", i + 1, min(i + batch_size, len(valid_relations)), len(valid_relations))
         with driver.session(database=neo4j_cfg.database) as session:
             session.run(cypher, {"relations": batch})
         imported += len(batch)

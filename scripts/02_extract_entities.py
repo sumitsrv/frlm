@@ -140,9 +140,17 @@ def _extract_entities_from_text(
                 entity_dict["cui"] = cui
                 entity_dict["confidence"] = round(float(score), 4)
                 # Resolve canonical name from linker KB
-                linker = nlp.get_pipe("scispacy_linker")
-                if hasattr(linker, "kb") and cui in linker.kb:
-                    entity_dict["canonical_name"] = linker.kb[cui].canonical_name
+                try:
+                    linker = nlp.get_pipe("scispacy_linker")
+                    kb = linker.kb
+                    # UmlsKnowledgeBase uses cui_to_entity dict, not __contains__
+                    cui_map = getattr(kb, "cui_to_entity", None)
+                    if cui_map is not None and cui in cui_map:
+                        entity_dict["canonical_name"] = cui_map[cui].canonical_name
+                    elif hasattr(kb, "__getitem__"):
+                        entity_dict["canonical_name"] = kb[cui].canonical_name
+                except Exception:
+                    pass  # canonical name lookup is best-effort
 
         entities.append(entity_dict)
 
@@ -218,6 +226,7 @@ def extract_entities(cfg: FRLMConfig) -> None:
     start_time = time.time()
     total_entities = 0
     total_chunks = 0
+    failed_files = 0
 
     for idx, xml_path in enumerate(xml_files, start=1):
         output_path = processed_dir / f"entities_{xml_path.stem}.json"
@@ -225,38 +234,47 @@ def extract_entities(cfg: FRLMConfig) -> None:
             logger.debug("Skipping already processed: %s", xml_path.stem)
             continue
 
-        sections = _parse_pmc_xml(xml_path, corpus_cfg.sections)
-        doc_entities: List[Dict[str, Any]] = []
+        try:
+            sections = _parse_pmc_xml(xml_path, corpus_cfg.sections)
+            doc_entities: List[Dict[str, Any]] = []
 
-        for sec in sections:
-            chunks = _chunk_text(
-                sec["text"], corpus_cfg.chunk_size, corpus_cfg.chunk_overlap
+            for sec in sections:
+                chunks = _chunk_text(
+                    sec["text"], corpus_cfg.chunk_size, corpus_cfg.chunk_overlap
+                )
+                for chunk_idx, chunk in enumerate(chunks):
+                    entities = _extract_entities_from_text(chunk, nlp, entity_cfg)
+                    for ent in entities:
+                        ent["pmcid"] = sec["pmcid"]
+                        ent["section"] = sec["section"]
+                        ent["chunk_idx"] = chunk_idx
+                    doc_entities.extend(entities)
+                    total_chunks += 1
+
+            total_entities += len(doc_entities)
+
+            # Atomic write
+            tmp_path = output_path.with_suffix(".json.tmp")
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(doc_entities, fh, indent=2, ensure_ascii=False)
+            tmp_path.replace(output_path)
+
+        except Exception as exc:
+            failed_files += 1
+            logger.error(
+                "Failed to process %s: %s", xml_path.name, exc, exc_info=True
             )
-            for chunk_idx, chunk in enumerate(chunks):
-                entities = _extract_entities_from_text(chunk, nlp, entity_cfg)
-                for ent in entities:
-                    ent["pmcid"] = sec["pmcid"]
-                    ent["section"] = sec["section"]
-                    ent["chunk_idx"] = chunk_idx
-                doc_entities.extend(entities)
-                total_chunks += 1
-
-        total_entities += len(doc_entities)
-
-        # Atomic write
-        tmp_path = output_path.with_suffix(".json.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            json.dump(doc_entities, fh, indent=2, ensure_ascii=False)
-        tmp_path.replace(output_path)
+            # Continue with the next file — don't lose all progress
 
         if idx % 50 == 0 or idx == len(xml_files):
             elapsed = time.time() - start_time
             logger.info(
-                "Entity extraction progress: %d/%d files, %d entities, %d chunks (%.1fs)",
+                "Entity extraction progress: %d/%d files, %d entities, %d chunks, %d failures (%.1fs)",
                 idx,
                 len(xml_files),
                 total_entities,
                 total_chunks,
+                failed_files,
                 elapsed,
             )
 
@@ -265,6 +283,7 @@ def extract_entities(cfg: FRLMConfig) -> None:
     logger.info("Files processed: %d", len(xml_files))
     logger.info("Total entities: %d", total_entities)
     logger.info("Total chunks: %d", total_chunks)
+    logger.info("Failed files: %d", failed_files)
     logger.info("Processing time: %.2f seconds", total_time)
 
 
