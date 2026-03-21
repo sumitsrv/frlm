@@ -104,7 +104,7 @@ neo4j:
   uri: "bolt://localhost:7687"
   username: "neo4j"
   password: "CHANGE_ME"          # override with FRLM_NEO4J_PASSWORD env var
-  database: "frlm"
+  database: "neo4j"               # Community Edition only supports default "neo4j" DB
   max_connection_pool_size: 50
   connection_timeout: 30         # seconds
   max_transaction_retry_time: 30 # seconds

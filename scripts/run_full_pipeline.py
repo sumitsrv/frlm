@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -313,6 +314,91 @@ def _prompt_cost_confirmation(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight checks — validate services & env vars before any step runs
+# ---------------------------------------------------------------------------
+
+
+def preflight_checks(
+    cfg: FRLMConfig,
+    start_from: int = 1,
+    stop_after: int = TOTAL_STEPS,
+) -> List[str]:
+    """Verify that required services and credentials are available.
+
+    Checks are scoped to the steps that will actually run (``start_from``
+    through ``stop_after``).
+
+    Returns a list of human-readable error strings.  An empty list means
+    all checks passed.
+    """
+    errors: List[str] = []
+    planned_steps = set(range(start_from, stop_after + 1))
+
+    # -- Steps that need Neo4j: 4, 5, 10, 11 --------------------------------
+    NEO4J_STEPS = {4, 5, 10, 11}
+    if planned_steps & NEO4J_STEPS:
+        # 1. Check password is not the placeholder
+        neo4j_cfg = cfg.neo4j
+        if neo4j_cfg.password in ("CHANGE_ME", ""):
+            errors.append(
+                "Neo4j password is not set. "
+                "Export FRLM_NEO4J_PASSWORD or update config/default.yaml → neo4j.password"
+            )
+
+        # 2. Check connectivity + auth
+        try:
+            from neo4j import GraphDatabase
+            from neo4j.exceptions import AuthError, ServiceUnavailable
+
+            driver = GraphDatabase.driver(
+                neo4j_cfg.uri,
+                auth=(neo4j_cfg.username, neo4j_cfg.password),
+            )
+            try:
+                driver.verify_connectivity()
+            except AuthError:
+                errors.append(
+                    f"Neo4j authentication failed (uri={neo4j_cfg.uri}, "
+                    f"user={neo4j_cfg.username}). Check FRLM_NEO4J_PASSWORD."
+                )
+            except ServiceUnavailable:
+                errors.append(
+                    f"Cannot reach Neo4j at {neo4j_cfg.uri}. "
+                    "Is the server running?  (try: make neo4j-status)"
+                )
+            except Exception as exc:
+                errors.append(f"Neo4j connection error: {exc}")
+            finally:
+                driver.close()
+        except ImportError:
+            errors.append(
+                "Python 'neo4j' package is not installed. Run: pip install neo4j"
+            )
+
+    # -- Steps that need Anthropic API: 3, 6 ---------------------------------
+    CLAUDE_STEPS = {3, 6}
+    if planned_steps & CLAUDE_STEPS:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", cfg.extraction.relation.api_key)
+        if not api_key or api_key in ("CHANGE_ME", ""):
+            errors.append(
+                "Anthropic API key is not set. "
+                "Export ANTHROPIC_API_KEY or update config → extraction.relation.api_key"
+            )
+
+    # -- Steps that need W&B: 7, 8, 9 ----------------------------------------
+    WANDB_STEPS = {7, 8, 9}
+    if planned_steps & WANDB_STEPS and cfg.wandb.enabled:
+        api_key = os.environ.get("WANDB_API_KEY", cfg.wandb.api_key)
+        if not api_key or api_key in ("CHANGE_ME", ""):
+            errors.append(
+                "W&B API key is not set but wandb.enabled=true. "
+                "Export WANDB_API_KEY, update config, or set wandb.enabled=false"
+            )
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # Step runner
 # ---------------------------------------------------------------------------
 
@@ -521,6 +607,30 @@ def run_pipeline(
 
     start_from = max(1, min(start_from, TOTAL_STEPS))
     stop_after = max(start_from, min(stop_after, TOTAL_STEPS))
+
+    # --- pre-flight checks ---
+    if not dry_run:
+        logger.info("Running pre-flight checks for steps %d → %d ...", start_from, stop_after)
+        pf_errors = preflight_checks(cfg, start_from, stop_after)
+        if pf_errors:
+            logger.error("=" * 70)
+            logger.error("  PRE-FLIGHT CHECKS FAILED")
+            logger.error("=" * 70)
+            for i, err in enumerate(pf_errors, 1):
+                logger.error("  %d. %s", i, err)
+            logger.error("=" * 70)
+            logger.error("Fix the above issues and re-run the pipeline.")
+            pipeline = PipelineResult(start_from=start_from)
+            pipeline.steps.append(
+                StepResult(
+                    step_number=0,
+                    name="Pre-flight checks",
+                    status=StepStatus.FAILED,
+                    message="; ".join(pf_errors),
+                )
+            )
+            return pipeline
+        logger.info("Pre-flight checks passed ✓")
 
     pipeline = PipelineResult(start_from=start_from)
     logger.info("=" * 70)

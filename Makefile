@@ -19,7 +19,7 @@ setup: ## Install all dependencies and the package in editable mode
 	$(PIP) install --upgrade pip setuptools wheel
 	$(PIP) install -r requirements.txt
 	$(PIP) install -e ".[dev,notebook]"
-	$(PYTHON) -m spacy download en_core_sci_lg || true
+	$(PIP) install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.3/en_core_sci_lg-0.5.3.tar.gz || true
 	@echo "Setup complete."
 
 .PHONY: setup-gpu
@@ -29,6 +29,22 @@ setup-gpu: ## Install with GPU-specific dependencies (CUDA 11.8)
 	$(PIP) install -r requirements.txt
 	$(PIP) install -e ".[dev,notebook]"
 	@echo "GPU setup complete."
+
+.PHONY: setup-neo4j
+setup-neo4j: ## Setup Neo4j via Docker (recommended)
+	bash scripts/setup_neo4j.sh docker
+
+.PHONY: setup-neo4j-native
+setup-neo4j-native: ## Setup Neo4j via native apt install
+	bash scripts/setup_neo4j.sh native
+
+.PHONY: neo4j-status
+neo4j-status: ## Check Neo4j status
+	bash scripts/setup_neo4j.sh status
+
+.PHONY: neo4j-stop
+neo4j-stop: ## Stop Neo4j
+	bash scripts/setup_neo4j.sh stop
 
 # ---------------------------------------------------------------------------
 # Data pipeline
@@ -104,8 +120,8 @@ dry-run: ## Dry-run: print pipeline commands without executing
 status: ## Show pipeline completion status (which steps have outputs)
 	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --status
 
-.PHONY: estimate-costs
-estimate-costs: ## Print estimated resource costs for the full pipeline
+.PHONY: estimate-costs estimate-cost
+estimate-costs estimate-cost: ## Print estimated resource costs for the full pipeline
 	$(PYTHON) scripts/estimate_costs.py --config $(CONFIG)
 
 # ---------------------------------------------------------------------------

@@ -252,7 +252,7 @@ class Neo4jConfig(BaseModel):
     uri: str = "bolt://localhost:7687"
     username: str = "neo4j"
     password: str = "CHANGE_ME"
-    database: str = "frlm"
+    database: str = "neo4j"
     max_connection_pool_size: int = 50
     connection_timeout: int = 30
     max_transaction_retry_time: int = 30
