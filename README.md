@@ -6,6 +6,27 @@
 
 ---
 
+## Motivation
+
+Large language models memorize vast amounts of factual knowledge inside their
+parameters during pre-training. This design has three well-known failure modes:
+facts go stale as the world changes, the model "hallucinates" plausible but
+incorrect statements, and updating even a single fact requires expensive
+re-training or fragile post-hoc patching. FRLM starts from a different premise —
+**linguistic competence and factual knowledge are separable concerns and should
+live in separate systems.** The model keeps its language abilities (syntax,
+reasoning, discourse) in learned parameters, while every factual claim is
+grounded in an external, append-only temporal knowledge graph that can be
+inspected, corrected, and versioned independently of the model weights. A learned
+router decides, at each generation step, whether the next token should come from
+the model's own vocabulary head or from a retrieval operation against the
+knowledge graph. The result is a system whose facts can be updated in real time
+without retraining, whose outputs are traceable to explicit source records, and
+whose factual accuracy can be measured and audited separately from its language
+fluency.
+
+---
+
 > **🚧 Project Status (March 2026):**  
 > **Phase 1 — Data Pipeline: Building Knowledge Base**  
 > Steps 1–3 complete (corpus downloaded, entities extracted, relations extracted).  
@@ -16,6 +37,7 @@
 
 ## Table of Contents
 
+- [Motivation](#motivation)
 - [Architecture Overview](#architecture-overview)
 - [Domain](#domain)
 - [Quick Start](#quick-start)
