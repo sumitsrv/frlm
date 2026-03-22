@@ -544,6 +544,7 @@ def init_wandb(
     config: Dict[str, Any],
     enabled: bool = True,
     entity: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Any:
     """Safely initialise a Weights & Biases run.
 
@@ -553,8 +554,13 @@ def init_wandb(
         logger.info("WandB disabled.")
         return None
     try:
+        import os
         import wandb
 
+        # Set API key via env-var so wandb.init() never triggers the
+        # interactive login prompt (which rejects newer v1 keys > 40 chars).
+        if api_key and api_key != "CHANGE_ME":
+            os.environ["WANDB_API_KEY"] = api_key
         run = wandb.init(
             project=project,
             entity=entity,

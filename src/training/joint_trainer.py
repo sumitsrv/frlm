@@ -362,6 +362,7 @@ class JointTrainer:
             },
             enabled=self._wandb_cfg.enabled,
             entity=self._wandb_cfg.entity,
+            api_key=self._wandb_cfg.api_key,
         )
 
         # --- Data ---
