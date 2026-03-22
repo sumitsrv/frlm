@@ -74,8 +74,12 @@ build-index: ## Build FAISS vector index over KG embeddings
 label-data: ## Generate router training labels with Claude API
 	$(PYTHON) scripts/06_generate_router_labels.py --config $(CONFIG)
 
+.PHONY: prepare-training-data
+prepare-training-data: ## Convert span labels → tokenized training data for all 3 phases
+	$(PYTHON) scripts/06b_prepare_training_data.py --config $(CONFIG)
+
 .PHONY: data-pipeline
-data-pipeline: download-corpus extract-entities extract-relations build-kg build-index label-data ## Run full data pipeline end-to-end
+data-pipeline: download-corpus extract-entities extract-relations build-kg build-index label-data prepare-training-data ## Run full data pipeline end-to-end
 	@echo "Data pipeline complete."
 
 # ---------------------------------------------------------------------------
@@ -117,8 +121,12 @@ dry-run: ## Dry-run: print pipeline commands without executing
 	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --dry-run
 
 .PHONY: status
-status: ## Show pipeline completion status (which steps have outputs)
+status: ## Show pipeline completion status (scans artifacts + persisted state)
 	$(PYTHON) scripts/run_full_pipeline.py --config $(CONFIG) --status
+
+.PHONY: status-json
+status-json: ## Dump pipeline status as JSON (machine-readable)
+	$(PYTHON) -c "import sys; sys.path.insert(0,'.'); from src.status import PipelineStatusTracker, scan_artifacts_into_status; from config.config import load_config; cfg=load_config('$(CONFIG)'); t=PipelineStatusTracker(); scan_artifacts_into_status(t, cfg); import json; print(json.dumps(t.get_all(), indent=2))"
 
 .PHONY: estimate-costs estimate-cost
 estimate-costs estimate-cost: ## Print estimated resource costs for the full pipeline
@@ -216,6 +224,30 @@ clean-data: ## Remove all processed data (keeps raw corpus)
 clean-all: clean clean-data ## Remove everything (artifacts + processed data)
 	rm -rf checkpoints/* logs/*
 	@echo "Full clean complete."
+
+# ---------------------------------------------------------------------------
+# Backup & Persistence
+# ---------------------------------------------------------------------------
+
+.PHONY: backup
+backup: ## Backup all pipeline data (local compressed archive)
+	bash scripts/backup_data.sh local
+
+.PHONY: backup-critical
+backup-critical: ## Backup only critical data (processed + labels — costly to regenerate)
+	@mkdir -p backups
+	tar -czf backups/frlm_critical_$$(date +%Y%m%d_%H%M%S).tar.gz \
+		data/processed data/labels data/kg
+	@echo "Critical data backed up to backups/"
+
+.PHONY: backup-status
+backup-status: ## Show current data sizes and backup inventory
+	bash scripts/backup_data.sh status
+	@echo ""; echo "Existing backups:"; ls -lh backups/ 2>/dev/null || echo "  (none)"
+
+.PHONY: restore
+restore: ## Restore data from a backup archive (usage: make restore ARCHIVE=backups/file.tar.gz)
+	bash scripts/backup_data.sh restore $(ARCHIVE)
 
 # ---------------------------------------------------------------------------
 # Help

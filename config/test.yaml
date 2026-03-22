@@ -1,0 +1,362 @@
+# =============================================================================
+# FRLM — Lightweight test config for pipeline feasibility validation
+#
+# Uses GPT-2 small (124M) instead of BioMedLM (2.7B) to fit in constrained
+# RAM/CPU. All code paths are identical — only backbone size differs.
+# =============================================================================
+
+# Inherit defaults then override
+_base_: "default.yaml"   # not actually used; config.py loads one file at a time
+
+project:
+  name: "frlm"
+  version: "0.1.0-test"
+  description: "FRLM feasibility test with GPT-2 small backbone"
+  seed: 42
+  deterministic: true
+
+paths:
+  project_root: "."
+  data_dir: "data"
+  corpus_dir: "data/corpus"
+  processed_dir: "data/processed"
+  kg_dir: "data/kg"
+  labels_dir: "data/labels"
+  checkpoints_dir: "checkpoints"
+  logs_dir: "logs"
+  cache_dir: "cache"
+  faiss_index_dir: "data/faiss_indices"
+  export_dir: "exports"
+
+# ---- Tiny backbone: GPT-2 small (124M params, ~500MB) ----
+model:
+  backbone:
+    name: "gpt2"                   # GPT-2 small instead of BioMedLM
+    hidden_dim: 768                # GPT-2 small hidden dim
+    num_layers: 12
+    num_heads: 12
+    vocab_size: 50257              # same tokenizer
+    max_seq_length: 512            # shorter for speed
+    dtype: "float32"               # CPU needs float32
+    gradient_checkpointing: false  # not needed for small model
+    freeze_backbone: false
+    freeze_layers: 0
+
+  router_head:
+    input_dim: 768
+    hidden_dim: 128
+    output_dim: 1
+    activation: "relu"
+    dropout: 0.1
+    threshold: 0.5
+
+  retrieval_head:
+    semantic:
+      input_dim: 768
+      output_dim: 768
+      normalize: true
+    granularity:
+      input_dim: 768
+      num_levels: 4
+      level_names: ["atomic", "relation", "entity", "cluster"]
+    temporal:
+      input_dim: 768
+      num_modes: 3
+      mode_names: ["CURRENT", "AT_TIMESTAMP", "HISTORY"]
+
+  generation_head:
+    input_dim: 768
+    output_dim: 50257
+    tie_weights: true
+
+sapbert:
+  model_name: "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+  embedding_dim: 768
+  max_length: 64
+  batch_size: 256
+  device: "cpu"
+  dtype: "float32"
+  pool_strategy: "cls"
+
+neo4j:
+  uri: "bolt://localhost:7687"
+  username: "neo4j"
+  password: "CHANGE_ME"
+  database: "neo4j"
+  max_connection_pool_size: 50
+  connection_timeout: 30
+  max_transaction_retry_time: 30
+  encrypted: false
+  trust: "TRUST_ALL_CERTIFICATES"
+  graph_schema:
+    fact_label: "Fact"
+    entity_label: "Entity"
+    relation_type: "HAS_FACT"
+    version_chain_type: "SUPERSEDES"
+    hash_algorithm: "sha256"
+    hash_separator: "||"
+  batch:
+    import_batch_size: 5000
+    query_batch_size: 1000
+    max_retries: 3
+    retry_delay: 1.0
+
+faiss:
+  index_type: "IVF4096,PQ64"
+  metric: "L2"
+  embedding_dim: 768
+  nprobe: 64
+  nlist: 4096
+  pq_m: 64
+  pq_nbits: 8
+  use_gpu: false
+  gpu_id: 0
+  train_sample_size: 500000
+  search_k: 100
+  use_precomputed_table: false
+  hierarchical:
+    level_0: "atomic"
+    level_1: "relation"
+    level_2: "entity"
+    level_3: "cluster"
+    default_level: 0
+  hard_negatives:
+    num_hard_negatives: 15
+    num_random_negatives: 5
+    mine_frequency: 1000
+    similarity_range:
+      min: 0.3
+      max: 0.8
+
+extraction:
+  entity:
+    spacy_model: "en_core_sci_lg"
+    linker: "umls"
+    resolve_abbreviations: true
+    min_entity_length: 2
+    max_entity_length: 100
+    confidence_threshold: 0.7
+    batch_size: 128
+    n_process: 4
+  relation:
+    model: "claude-sonnet-4-6"
+    api_key: "CHANGE_ME"
+    max_tokens: 4096
+    temperature: 0.0
+    batch_size: 10
+    max_retries: 3
+    retry_delay: 2.0
+    rate_limit_rpm: 50
+    rate_limit_tpm: 100000
+    system_prompt: |
+      You are a biomedical relation extraction system specialized in oncology pharmacology.
+      Extract structured relations from the provided text as JSON.
+  corpus:
+    source: "pmc_oa"
+    format: "xml"
+    max_documents: 100
+    filter_journals: []
+    min_year: 2000
+    max_year: null
+    sections: ["abstract", "introduction", "methods", "results", "discussion"]
+    chunk_size: 512
+    chunk_overlap: 64
+
+labeling:
+  model: "claude-haiku-4-5-20251001"
+  api_key: "CHANGE_ME"
+  max_tokens: 4096
+  temperature: 0.0
+  batch_size: 5
+  max_retries: 3
+  retry_delay: 2.0
+  rate_limit_rpm: 50
+  inter_annotator_samples: 200
+  min_agreement_threshold: 0.8
+  system_prompt: |
+    You are annotating biomedical text for a factual retrieval language model.
+  validation:
+    min_retrieval_ratio: 0.15
+    max_retrieval_ratio: 0.85
+    min_spans_per_chunk: 1
+    max_spans_per_chunk: 10000
+
+# ---- Minimal training for feasibility test ----
+training:
+  output_dir: "checkpoints"
+  seed: 42
+  fp16: false                      # CPU → no fp16
+  bf16: false
+  gradient_accumulation_steps: 1   # no accumulation for test
+  max_grad_norm: 1.0
+  dataloader_num_workers: 0        # avoid multiprocessing issues
+  pin_memory: false
+  log_every_n_steps: 1
+  eval_every_n_steps: 5
+  save_every_n_steps: 10
+  max_checkpoints: 2
+
+  router:
+    epochs: 2                      # minimal
+    batch_size: 4
+    learning_rate: 5.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.1
+    scheduler: "cosine"
+    label_smoothing: 0.05
+    pos_weight: 1.5
+    early_stopping_patience: 3
+    early_stopping_metric: "f1"
+    freeze_backbone: true
+
+  retrieval:
+    epochs: 2
+    batch_size: 4
+    learning_rate: 2.0e-4
+    weight_decay: 0.01
+    warmup_ratio: 0.1
+    scheduler: "cosine"
+    contrastive_temperature: 0.07
+    margin: 0.2
+    early_stopping_patience: 5
+    early_stopping_metric: "precision_at_1"
+    freeze_backbone: false
+    freeze_router: true
+
+  joint:
+    epochs: 2
+    batch_size: 2
+    learning_rate: 5.0e-5
+    weight_decay: 0.01
+    warmup_ratio: 0.05
+    scheduler: "cosine_with_restarts"
+    num_cycles: 1
+    early_stopping_patience: 5
+    early_stopping_metric: "combined_loss"
+    freeze_backbone: false
+    freeze_router: false
+    freeze_retrieval: false
+
+  splits:
+    train: 0.8
+    validation: 0.1
+    test: 0.1
+    stratify_by: "retrieval_ratio"
+
+loss:
+  router_weight: 1.0
+  retrieval_weight: 2.0
+  generation_weight: 1.0
+  contrastive_temperature: 0.07
+
+deepspeed:
+  enabled: false                   # disabled for test
+  config:
+    train_batch_size: "auto"
+    train_micro_batch_size_per_gpu: "auto"
+    gradient_accumulation_steps: "auto"
+    gradient_clipping: 1.0
+    fp16:
+      enabled: false
+    zero_optimization:
+      stage: 2
+      offload_optimizer:
+        device: "cpu"
+        pin_memory: true
+      offload_param:
+        device: "none"
+      overlap_comm: true
+      contiguous_gradients: true
+      reduce_bucket_size: 5.0e+8
+      allgather_bucket_size: 5.0e+8
+    optimizer:
+      type: "AdamW"
+      params:
+        lr: "auto"
+        betas: [0.9, 0.999]
+        eps: 1.0e-8
+        weight_decay: "auto"
+    scheduler:
+      type: "WarmupDecayLR"
+      params:
+        warmup_min_lr: 0
+        warmup_max_lr: "auto"
+        warmup_num_steps: "auto"
+        total_num_steps: "auto"
+    activation_checkpointing:
+      partition_activations: true
+      cpu_checkpointing: false
+      contiguous_memory_optimization: false
+      number_checkpoints: null
+      synchronize_checkpoint_boundary: false
+      profile: false
+
+wandb:
+  enabled: false                   # disabled for test
+  project: "frlm-test"
+  entity: null
+  run_name: null
+  tags: ["test", "feasibility"]
+  log_model: false
+  log_frequency: 10
+  watch_model: false
+  api_key: "CHANGE_ME"
+
+evaluation:
+  retrieval:
+    k_values: [1, 5, 10, 20]
+    temporal_accuracy: true
+    granularity_accuracy: true
+    num_eval_samples: 100
+  generation:
+    max_length: 128
+    temperature: 1.0
+    top_k: 50
+    top_p: 0.95
+    num_eval_samples: 50
+    compute_perplexity: true
+    compute_bleu: false
+    compute_rouge: false
+  router:
+    threshold_sweep: [0.3, 0.5, 0.7]
+    compute_confusion_matrix: true
+    compute_calibration: true
+    num_eval_samples: 100
+  end_to_end:
+    num_eval_samples: 20
+    compute_factual_accuracy: true
+    compute_temporal_consistency: true
+
+inference:
+  device: "cpu"
+  dtype: "float32"
+  max_length: 256
+  temperature: 0.7
+  top_k: 50
+  top_p: 0.95
+  do_sample: true
+  num_beams: 1
+  repetition_penalty: 1.1
+  router_threshold: 0.5
+  batch_size: 1
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  reload: false
+  log_level: "info"
+  cors_origins: ["*"]
+  max_concurrent_requests: 16
+  request_timeout: 60
+  model_warmup: true
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(name)-30s | %(levelname)-8s | %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+  file: "logs/frlm.log"
+  max_bytes: 10485760
+  backup_count: 5
+  console: true
+

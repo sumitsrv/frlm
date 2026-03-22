@@ -195,6 +195,54 @@ def _build_version_chains(driver: Any, neo4j_cfg: Any) -> int:
         return result.single()["chains_created"]
 
 
+def _export_facts_to_json(driver: Any, neo4j_cfg: Any, kg_dir: Path) -> int:
+    """Export all Fact nodes from Neo4j to exported_facts.json for downstream steps.
+
+    Step 5 (FAISS index building) reads from this file rather than querying
+    Neo4j live, so it must be written after every successful import.
+    """
+    schema = neo4j_cfg.graph_schema
+
+    cypher = (
+        f"MATCH (f:{schema.fact_label}) "
+        f"RETURN f.hash AS hash, f.subject AS subject_id, "
+        f"f.relation_type AS relation_type, f.object AS object_id, "
+        f"f.confidence AS confidence, f.evidence_span AS evidence_span, "
+        f"f.valid_from AS valid_from, f.valid_to AS valid_to"
+    )
+
+    logger.info("Exporting facts from Neo4j to exported_facts.json")
+    facts: List[Dict[str, Any]] = []
+    with driver.session(database=neo4j_cfg.database) as session:
+        result = session.run(cypher)
+        for record in result:
+            fact = {
+                "hash": record["hash"],
+                "subject_id": record["subject_id"] or "",
+                "subject_label": record["subject_id"] or "",
+                "subject_entity_type": "unknown",
+                "relation_type": record["relation_type"] or "",
+                "object_id": record["object_id"] or "",
+                "object_label": record["object_id"] or "",
+                "object_entity_type": "unknown",
+                "confidence": record["confidence"] if record["confidence"] is not None else 1.0,
+                "evidence_span": record["evidence_span"] or "",
+                "valid_from": record["valid_from"] or "2000-01-01",
+                "valid_to": record["valid_to"],
+                "source": "neo4j_export",
+                "metadata": "{}",
+            }
+            facts.append(fact)
+
+    kg_dir.mkdir(parents=True, exist_ok=True)
+    facts_path = kg_dir / "exported_facts.json"
+    with open(facts_path, "w", encoding="utf-8") as fh:
+        json.dump(facts, fh, indent=2, ensure_ascii=False)
+
+    logger.info("Exported %d facts to %s", len(facts), facts_path)
+    return len(facts)
+
+
 def populate_kg(cfg: FRLMConfig) -> None:
     """Orchestrate KG population: connect, create schema, import, build chains."""
     neo4j_cfg = cfg.neo4j
@@ -227,6 +275,12 @@ def populate_kg(cfg: FRLMConfig) -> None:
         chain_count = _build_version_chains(driver, neo4j_cfg)
         logger.info("Built %d version chains in %.2fs", chain_count, time.time() - t0)
 
+        # Export facts for downstream steps (FAISS index, etc.)
+        t0 = time.time()
+        kg_dir = cfg.paths.resolve("kg_dir")
+        export_count = _export_facts_to_json(driver, neo4j_cfg, kg_dir)
+        logger.info("Exported %d facts in %.2fs", export_count, time.time() - t0)
+
         # Write summary
         kg_dir = cfg.paths.resolve("kg_dir")
         kg_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +288,7 @@ def populate_kg(cfg: FRLMConfig) -> None:
             "entities_imported": entity_count,
             "relations_imported": relation_count,
             "version_chains": chain_count,
+            "facts_exported": export_count,
         }
         with open(kg_dir / "kg_import_summary.json", "w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2)

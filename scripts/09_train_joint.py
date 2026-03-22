@@ -119,7 +119,11 @@ def train_joint(
     model = FRLMModel.from_config(cfg)
 
     # --- Build datasets ---
-    data_dir = cfg.paths.resolve("processed_dir")
+    # Joint data lives in processed_dir/joint (written by 06b)
+    data_dir = cfg.paths.resolve("processed_dir") / "joint"
+    if not data_dir.exists() or not list(data_dir.glob("*.json*")):
+        # Fallback to processed_dir for backward compatibility
+        data_dir = cfg.paths.resolve("processed_dir")
     emb_dim = cfg.model.retrieval_head.semantic.output_dim
     num_neg = (
         cfg.faiss.hard_negatives.num_hard_negatives

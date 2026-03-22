@@ -213,9 +213,9 @@ class LabelValidator:
         text_length: int,
         *,
         min_retrieval_ratio: float = 0.15,
-        max_retrieval_ratio: float = 0.70,
+        max_retrieval_ratio: float = 0.85,
         min_spans_per_chunk: int = 1,
-        max_spans_per_chunk: int = 50,
+        max_spans_per_chunk: int = 10000,
     ) -> Tuple[bool, List[str]]:
         """Validate labels against quality thresholds.
 

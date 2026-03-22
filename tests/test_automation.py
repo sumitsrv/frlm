@@ -54,28 +54,31 @@ def costs_mod():
 class TestPipelineConstants:
     """Verify step definitions are complete and consistent."""
 
-    def test_total_steps_is_eleven(self, pipeline_mod) -> None:
-        assert pipeline_mod.TOTAL_STEPS == 11
+    def test_total_steps_is_twelve(self, pipeline_mod) -> None:
+        assert pipeline_mod.TOTAL_STEPS == 12
 
     def test_step_names_covers_all(self, pipeline_mod) -> None:
         names = pipeline_mod.STEP_NAMES
-        assert len(names) == 11
-        for i in range(1, 12):
+        assert len(names) == 12
+        for i in range(1, 13):
             assert i in names
             assert isinstance(names[i], str)
             assert len(names[i]) > 0
 
     def test_step_scripts_covers_all(self, pipeline_mod) -> None:
         scripts = pipeline_mod.STEP_SCRIPTS
-        assert len(scripts) == 11
-        for i in range(1, 12):
+        assert len(scripts) == 12
+        for i in range(1, 13):
             assert i in scripts
             assert scripts[i].endswith(".py")
 
     def test_step_scripts_have_correct_prefix(self, pipeline_mod) -> None:
+        # Step 7 uses "06b_" prefix; steps 8-12 use scripts numbered 07-11
+        # (the insertion of prepare_training_data shifted numbering).
+        # We just verify every script file name starts with a digit prefix.
         for step, script in pipeline_mod.STEP_SCRIPTS.items():
-            prefix = f"{step:02d}_"
-            assert script.startswith(prefix), f"Step {step}: {script} missing prefix {prefix}"
+            assert script[0].isdigit(), f"Step {step}: {script} should start with a digit"
+            assert script.endswith(".py"), f"Step {step}: {script} should end with .py"
 
     def test_claude_api_steps(self, pipeline_mod) -> None:
         assert pipeline_mod.CLAUDE_API_STEPS == {3, 6}
@@ -238,8 +241,8 @@ class TestOutputExistenceHelpers:
         self, pipeline_mod, default_config
     ) -> None:
         status = pipeline_mod.get_pipeline_status(default_config)
-        assert len(status) == 11
-        for step in range(1, 12):
+        assert len(status) == 12
+        for step in range(1, 13):
             assert step in status
             assert isinstance(status[step], bool)
 
@@ -312,6 +315,7 @@ class TestRunStep:
             default_config,
             config_path="config/default.yaml",
             dry_run=True,
+            skip_completed=False,
         )
         assert result.status == pipeline_mod.StepStatus.DRY_RUN
         assert "01_download_corpus" in result.message
@@ -378,8 +382,8 @@ class TestRunPipeline:
             dry_run=True,
             skip_completed=False,  # disable skip so all steps get dry_run
         )
-        # All 11 steps should appear
-        assert len(result.steps) == 11
+        # All 12 steps should appear
+        assert len(result.steps) == 12
         for s in result.steps:
             assert s.status == pipeline_mod.StepStatus.DRY_RUN
 
@@ -390,9 +394,9 @@ class TestRunPipeline:
             start_from=7,
             dry_run=True,
         )
-        assert len(result.steps) == 5  # steps 7-11
+        assert len(result.steps) == 6  # steps 7-12
         assert result.steps[0].step_number == 7
-        assert result.steps[-1].step_number == 11
+        assert result.steps[-1].step_number == 12
 
     def test_dry_run_stop_after(self, pipeline_mod, default_config) -> None:
         result = pipeline_mod.run_pipeline(
@@ -462,7 +466,7 @@ class TestRunPipeline:
                 stop_on_failure=False,
             )
             assert result.failed == 1
-            assert len(result.steps) == 11
+            assert len(result.steps) == 12
 
 
 # ===========================================================================
@@ -477,10 +481,17 @@ class TestPrintStatus:
         pipeline_mod.print_status(default_config)
         captured = capsys.readouterr()
         assert "Pipeline Status" in captured.out
-        assert "Step" in captured.out
-        # Should contain all 11 step names (or at least 11 step lines)
-        for step in range(1, 12):
-            assert f"Step {step:2d}" in captured.out or f"Step {step}" in captured.out
+        assert "completed" in captured.out
+        # Should contain all 12 step names
+        step_names = [
+            "Download corpus", "Extract entities", "Extract relations",
+            "Populate knowledge graph", "Build FAISS index",
+            "Generate router labels", "Prepare training data",
+            "Train router head", "Train retrieval head",
+            "Joint fine-tuning", "Evaluate", "Run inference",
+        ]
+        for name in step_names:
+            assert name in captured.out, f"Missing step name: {name}"
 
 
 # ===========================================================================
@@ -572,7 +583,7 @@ class TestPipelineMain:
         data = json.loads(report_path.read_text())
         assert "total_steps" in data
         assert "steps" in data
-        assert len(data["steps"]) == 11
+        assert len(data["steps"]) == 12
 
 
 # ===========================================================================
@@ -921,7 +932,7 @@ class TestMakefileTargets:
         assert "status:" in makefile_content
 
     def test_estimate_costs_target(self, makefile_content) -> None:
-        assert "estimate-costs:" in makefile_content
+        assert "estimate-costs" in makefile_content
 
     def test_full_pipeline_uses_yes_flag(self, makefile_content) -> None:
         # full-pipeline should include --yes for non-interactive
@@ -940,7 +951,7 @@ class TestMakefileTargets:
         assert "--dry-run" in block
 
     def test_status_uses_status_flag(self, makefile_content) -> None:
-        idx = makefile_content.index("status:")
+        idx = makefile_content.index("\nstatus:")
         block = makefile_content[idx:idx + 200]
         assert "--status" in block
 

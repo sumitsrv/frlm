@@ -101,7 +101,11 @@ def train_retrieval(
     model = FRLMModel.from_config(cfg)
 
     # --- Build datasets ---
-    data_dir = cfg.paths.resolve("processed_dir")
+    # Retrieval data lives in processed_dir/retrieval (written by 06b)
+    data_dir = cfg.paths.resolve("processed_dir") / "retrieval"
+    if not data_dir.exists() or not list(data_dir.glob("*.json*")):
+        # Fallback to processed_dir for backward compatibility
+        data_dir = cfg.paths.resolve("processed_dir")
     emb_dim = cfg.model.retrieval_head.semantic.output_dim
     num_neg = (
         faiss_cfg.hard_negatives.num_hard_negatives

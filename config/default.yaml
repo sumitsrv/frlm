@@ -93,8 +93,8 @@ sapbert:
   embedding_dim: 768
   max_length: 64
   batch_size: 256
-  device: "cuda"
-  dtype: "float16"
+  device: "cpu"
+  dtype: "float32"
   pool_strategy: "cls"  # cls, mean, max
 
 # -----------------------------------------------------------------------------
@@ -235,9 +235,9 @@ labeling:
   # Label quality
   validation:
     min_retrieval_ratio: 0.15       # minimum fraction of tokens labeled retrieval
-    max_retrieval_ratio: 0.70       # maximum fraction of tokens labeled retrieval
+    max_retrieval_ratio: 0.85       # maximum fraction; fact-dense biomedical papers can reach ~0.8
     min_spans_per_chunk: 1
-    max_spans_per_chunk: 50
+    max_spans_per_chunk: 10000      # per-file limit; whole papers yield 300–2000 spans
 
 # -----------------------------------------------------------------------------
 # Training

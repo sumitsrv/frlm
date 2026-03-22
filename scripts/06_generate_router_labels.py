@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.config import FRLMConfig, load_config, setup_logging
 from src.labeling.llm_labeler import LLMLabeler, SpanLabel
 from src.labeling.label_validator import LabelValidator
+from src.status import PipelineStatusTracker
 
 logger = logging.getLogger(__name__)
 
@@ -159,11 +160,15 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
     # -- 3. Label each file ----------------------------------------------
     labeler = LLMLabeler.from_config(labeling_cfg)
     validator = LabelValidator()
+    tracker = PipelineStatusTracker()
+    tracker.mark_running(6, total_items=len(chunk_files))
 
     start_time = time.time()
     total_labeled = 0
     total_valid = 0
     total_invalid = 0
+    completed_files = 0
+    skipped_files = 0
     all_spans: List[SpanLabel] = []
     review_records: List[Dict[str, Any]] = []
 
@@ -176,6 +181,8 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
         # Resume: skip already-labelled files
         if label_path.exists():
             logger.debug("Skipping already labelled: %s", chunk_path.name)
+            skipped_files += 1
+            completed_files += 1
             continue
 
         try:
@@ -236,6 +243,7 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 json.dump(output, fh, indent=2, ensure_ascii=False)
             tmp_path.replace(label_path)
+            completed_files += 1
 
         except (json.JSONDecodeError, OSError) as exc:
             logger.error("Failed to process %s: %s", chunk_path.name, exc)
@@ -250,8 +258,29 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
                 total_invalid,
                 labeler.cost_tracker.estimated_cost_usd,
             )
+            tracker.update_progress(
+                6,
+                completed_items=completed_files,
+                skipped_items=skipped_files,
+                failed_items=total_invalid,
+                cost_usd=labeler.cost_tracker.estimated_cost_usd,
+            )
+            tracker.save()
 
     elapsed = time.time() - start_time
+
+    # -- Update tracker with final state ----------------------------------
+    tracker.update_progress(
+        6,
+        completed_items=completed_files,
+        skipped_items=skipped_files,
+        failed_items=total_invalid,
+        cost_usd=labeler.cost_tracker.estimated_cost_usd,
+    )
+    if completed_files >= len(chunk_files):
+        tracker.mark_completed(6)
+    else:
+        tracker.mark_partial(6)
 
     # -- 4. Corpus-level statistics --------------------------------------
     stats = validator.compute_statistics(all_spans)
@@ -353,9 +382,13 @@ def main() -> None:
             generate_labels(cfg, max_files=args.max_files)
     except KeyboardInterrupt:
         logger.warning("Label generation interrupted.")
+        tracker = PipelineStatusTracker()
+        tracker.mark_partial(6)
         sys.exit(130)
     except Exception:
         logger.exception("Label generation failed.")
+        tracker = PipelineStatusTracker()
+        tracker.mark_failed(6, "Unhandled exception")
         sys.exit(1)
 
     logger.info("06_generate_router_labels completed successfully.")

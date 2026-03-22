@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.config import FRLMConfig, load_config, setup_logging
+from src.status import PipelineStatusTracker
 
 logger = logging.getLogger(__name__)
 
@@ -385,6 +386,9 @@ def extract_relations(cfg: FRLMConfig) -> None:
 
     logger.info("Found %d entity files", len(entity_files))
 
+    tracker = PipelineStatusTracker()
+    tracker.mark_running(3, total_items=len(entity_files))
+
     rate_limiter = RateLimiter(
         requests_per_minute=relation_cfg.rate_limit_rpm,
         tokens_per_minute=relation_cfg.rate_limit_tpm,
@@ -394,6 +398,8 @@ def extract_relations(cfg: FRLMConfig) -> None:
     total_relations = 0
     total_api_calls = 0
     errors = 0
+    completed_files = 0
+    skipped_files = 0
 
     for idx, entity_path in enumerate(entity_files, start=1):
         relation_filename = entity_path.name.replace("entities_", "relations_")
@@ -401,6 +407,8 @@ def extract_relations(cfg: FRLMConfig) -> None:
 
         if relation_path.exists():
             logger.debug("Skipping already processed: %s", entity_path.name)
+            skipped_files += 1
+            completed_files += 1
             continue
 
         try:
@@ -453,6 +461,7 @@ def extract_relations(cfg: FRLMConfig) -> None:
 
             total_relations += len(all_relations)
             _atomic_write_json(relation_path, all_relations)
+            completed_files += 1
 
         except Exception as exc:
             logger.error("Failed to process %s: %s", entity_path.name, exc, exc_info=True)
@@ -463,8 +472,26 @@ def extract_relations(cfg: FRLMConfig) -> None:
                 "Progress: %d/%d files, %d relations, %d API calls, %d errors",
                 idx, len(entity_files), total_relations, total_api_calls, errors,
             )
+            tracker.update_progress(
+                3,
+                completed_items=completed_files,
+                skipped_items=skipped_files,
+                failed_items=errors,
+            )
+            tracker.save()
 
     total_time = time.time() - start_time
+    tracker.update_progress(
+        3,
+        completed_items=completed_files,
+        skipped_items=skipped_files,
+        failed_items=errors,
+    )
+    if errors == 0:
+        tracker.mark_completed(3)
+    else:
+        tracker.mark_partial(3)
+
     logger.info("=== Relation Extraction Summary ===")
     logger.info("Files: %d, Relations: %d, API calls: %d, Errors: %d",
                 len(entity_files), total_relations, total_api_calls, errors)

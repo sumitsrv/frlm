@@ -65,6 +65,8 @@ class RelationType(str, Enum):
     TRANSPORTS = "TRANSPORTS"
     CATALYZES = "CATALYZES"
     ENCODES = "ENCODES"
+    DOSAGE_OF = "DOSAGE_OF"
+    RESISTANCE_TO = "RESISTANCE_TO"
 
 
 # ===========================================================================

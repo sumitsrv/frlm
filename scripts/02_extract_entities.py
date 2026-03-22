@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.config import FRLMConfig, load_config, setup_logging
+from src.status import PipelineStatusTracker
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,8 @@ def extract_entities(cfg: FRLMConfig) -> None:
     processed_dir = cfg.paths.resolve("processed_dir")
     processed_dir.mkdir(parents=True, exist_ok=True)
 
+    tracker = PipelineStatusTracker()
+
     logger.info("=== Entity Extraction (SciSpacy + UMLS) ===")
     logger.info("Model: %s", entity_cfg.spacy_model)
     logger.info("Linker: %s", entity_cfg.linker)
@@ -222,16 +225,22 @@ def extract_entities(cfg: FRLMConfig) -> None:
         logger.warning("No XML files found. Run step 01 first.")
         return
 
+    tracker.mark_running(2, total_items=len(xml_files))
+
     # Step 3 & 4: process
     start_time = time.time()
     total_entities = 0
     total_chunks = 0
     failed_files = 0
+    completed_files = 0
+    skipped_files = 0
 
     for idx, xml_path in enumerate(xml_files, start=1):
         output_path = processed_dir / f"entities_{xml_path.stem}.json"
         if output_path.exists():
             logger.debug("Skipping already processed: %s", xml_path.stem)
+            skipped_files += 1
+            completed_files += 1
             continue
 
         try:
@@ -258,6 +267,7 @@ def extract_entities(cfg: FRLMConfig) -> None:
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 json.dump(doc_entities, fh, indent=2, ensure_ascii=False)
             tmp_path.replace(output_path)
+            completed_files += 1
 
         except Exception as exc:
             failed_files += 1
@@ -277,8 +287,26 @@ def extract_entities(cfg: FRLMConfig) -> None:
                 failed_files,
                 elapsed,
             )
+            tracker.update_progress(
+                2,
+                completed_items=completed_files,
+                skipped_items=skipped_files,
+                failed_items=failed_files,
+            )
+            tracker.save()
 
     total_time = time.time() - start_time
+    tracker.update_progress(
+        2,
+        completed_items=completed_files,
+        skipped_items=skipped_files,
+        failed_items=failed_files,
+    )
+    if failed_files == 0:
+        tracker.mark_completed(2)
+    else:
+        tracker.mark_partial(2)
+
     logger.info("=== Entity Extraction Summary ===")
     logger.info("Files processed: %d", len(xml_files))
     logger.info("Total entities: %d", total_entities)

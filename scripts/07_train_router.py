@@ -73,10 +73,15 @@ def train_router(cfg: FRLMConfig, resume_path: str | None = None) -> Dict[str, f
 
     # --- Build datasets ---
     labels_dir = cfg.paths.resolve("labels_dir")
+    # Use tokenized subdirectory (produced by 06b_prepare_training_data)
+    tokenized_dir = labels_dir / "tokenized"
+    if not tokenized_dir.exists() or not list(tokenized_dir.glob("*.jsonl")):
+        # Fall back to labels_dir for backward compatibility
+        tokenized_dir = labels_dir
     max_seq = cfg.model.backbone.max_seq_length
 
-    logger.info("Loading router labels from %s", labels_dir)
-    full_ds = RouterDataset(data_dir=labels_dir, max_seq_length=max_seq)
+    logger.info("Loading router labels from %s", tokenized_dir)
+    full_ds = RouterDataset(data_dir=tokenized_dir, max_seq_length=max_seq)
 
     if len(full_ds) == 0:
         logger.error("No training data found in %s. Run step 06 first.", labels_dir)

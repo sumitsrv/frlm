@@ -2,7 +2,7 @@
 """
 run_full_pipeline.py — Master orchestration script for the FRLM pipeline.
 
-Runs all 11 pipeline steps sequentially with per-step timing, skip-if-exists
+Runs all 12 pipeline steps sequentially with per-step timing, skip-if-exists
 logic, cost estimation prompts before Claude-API steps, ``--start-from``
 resume support, and ``--dry-run`` mode.
 
@@ -14,11 +14,12 @@ Steps
  4  Populate knowledge graph (04_populate_kg.py)
  5  Build FAISS index        (05_build_faiss_index.py)
  6  Generate router labels   (06_generate_router_labels.py) [Claude API]
- 7  Train router head        (07_train_router.py)
- 8  Train retrieval head     (08_train_retrieval.py)
- 9  Joint fine-tuning        (09_train_joint.py)
-10  Evaluate                 (10_evaluate.py)
-11  Run inference            (11_run_inference.py)
+ 7  Prepare training data    (06b_prepare_training_data.py)
+ 8  Train router head        (07_train_router.py)
+ 9  Train retrieval head     (08_train_retrieval.py)
+10  Joint fine-tuning        (09_train_joint.py)
+11  Evaluate                 (10_evaluate.py)
+12  Run inference            (11_run_inference.py)
 
 Usage
 -----
@@ -51,6 +52,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.config import FRLMConfig, load_config, setup_logging
+from src.status import PipelineStatusTracker, scan_artifacts_into_status
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-TOTAL_STEPS = 11
+TOTAL_STEPS = 12
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
 
@@ -166,17 +168,18 @@ def check_step_complete(step: int, cfg: FRLMConfig) -> bool:
         ),
         5: lambda: _dir_not_empty(paths.resolve("faiss_index_dir")),
         6: lambda: _dir_not_empty(paths.resolve("labels_dir")),
-        7: lambda: _dir_not_empty(
+        7: lambda: _has_files(paths.resolve("labels_dir") / "tokenized", "*.jsonl"),
+        8: lambda: _dir_not_empty(
             Path(cfg.training.output_dir) / "phase1_router"
         ),
-        8: lambda: _dir_not_empty(
+        9: lambda: _dir_not_empty(
             Path(cfg.training.output_dir) / "phase2_retrieval"
         ),
-        9: lambda: _dir_not_empty(
+        10: lambda: _dir_not_empty(
             Path(cfg.training.output_dir) / "phase3_joint"
         ),
-        10: lambda: _has_files(paths.resolve("export_dir"), "eval_results*"),
-        11: lambda: _has_files(paths.resolve("export_dir"), "inference_results*"),
+        11: lambda: _has_files(paths.resolve("export_dir"), "eval_results*"),
+        12: lambda: _has_files(paths.resolve("export_dir"), "inference_results*"),
     }
     checker = checks.get(step)
     if checker is None:
@@ -203,11 +206,12 @@ STEP_NAMES: Dict[int, str] = {
     4: "Populate knowledge graph",
     5: "Build FAISS index",
     6: "Generate router labels",
-    7: "Train router head",
-    8: "Train retrieval head",
-    9: "Joint fine-tuning",
-    10: "Evaluate",
-    11: "Run inference",
+    7: "Prepare training data",
+    8: "Train router head",
+    9: "Train retrieval head",
+    10: "Joint fine-tuning",
+    11: "Evaluate",
+    12: "Run inference",
 }
 
 STEP_SCRIPTS: Dict[int, str] = {
@@ -217,11 +221,12 @@ STEP_SCRIPTS: Dict[int, str] = {
     4: "04_populate_kg.py",
     5: "05_build_faiss_index.py",
     6: "06_generate_router_labels.py",
-    7: "07_train_router.py",
-    8: "08_train_retrieval.py",
-    9: "09_train_joint.py",
-    10: "10_evaluate.py",
-    11: "11_run_inference.py",
+    7: "06b_prepare_training_data.py",
+    8: "07_train_router.py",
+    9: "08_train_retrieval.py",
+    10: "09_train_joint.py",
+    11: "10_evaluate.py",
+    12: "11_run_inference.py",
 }
 
 # Steps that use the Claude API and thus incur cost
@@ -334,8 +339,8 @@ def preflight_checks(
     errors: List[str] = []
     planned_steps = set(range(start_from, stop_after + 1))
 
-    # -- Steps that need Neo4j: 4, 5, 10, 11 --------------------------------
-    NEO4J_STEPS = {4, 5, 10, 11}
+    # -- Steps that need Neo4j: 4, 5, 11, 12 --------------------------------
+    NEO4J_STEPS = {4, 5, 11, 12}
     if planned_steps & NEO4J_STEPS:
         # 1. Check password is not the placeholder
         neo4j_cfg = cfg.neo4j
@@ -412,13 +417,14 @@ def run_step(
     skip_completed: bool = True,
     auto_yes: bool = False,
     extra_args: Optional[Sequence[str]] = None,
+    tracker: Optional[PipelineStatusTracker] = None,
 ) -> StepResult:
     """Execute a single pipeline step.
 
     Parameters
     ----------
     step : int
-        Step number (1–11).
+        Step number (1–12).
     cfg : FRLMConfig
         Loaded configuration.
     config_path : str
@@ -431,6 +437,8 @@ def run_step(
         If True, skip interactive cost-confirmation prompts.
     extra_args : sequence of str, optional
         Additional CLI arguments forwarded to the sub-script.
+    tracker : PipelineStatusTracker, optional
+        Centralized status tracker (updated on every state transition).
 
     Returns
     -------
@@ -440,6 +448,8 @@ def run_step(
     script = STEP_SCRIPTS.get(step)
 
     if script is None:
+        if tracker:
+            tracker.mark_failed(step, f"No script registered for step {step}")
         return StepResult(
             step_number=step,
             name=name,
@@ -452,6 +462,8 @@ def run_step(
         logger.info(
             "[Step %2d/%d] %-28s — SKIP (output exists)", step, TOTAL_STEPS, name
         )
+        if tracker:
+            tracker.mark_skipped(step, "output artefacts already exist")
         return StepResult(
             step_number=step,
             name=name,
@@ -486,6 +498,8 @@ def run_step(
                 TOTAL_STEPS,
                 name,
             )
+            if tracker:
+                tracker.mark_skipped(step, "user declined cost estimate")
             return StepResult(
                 step_number=step,
                 name=name,
@@ -507,6 +521,9 @@ def run_step(
         " ".join(cmd),
     )
 
+    if tracker:
+        tracker.mark_running(step)
+
     t0 = time.time()
     try:
         result = subprocess.run(
@@ -524,6 +541,10 @@ def run_step(
             name,
             elapsed,
         )
+        if tracker:
+            tracker.mark_completed(step)
+            # Back-fill item counts from artifacts after completion
+            scan_artifacts_into_status(tracker, cfg)
         return StepResult(
             step_number=step,
             name=name,
@@ -540,6 +561,10 @@ def run_step(
             exc.returncode,
             elapsed,
         )
+        if tracker:
+            tracker.mark_failed(step, f"Exit code {exc.returncode}")
+            # Still scan for partial progress
+            scan_artifacts_into_status(tracker, cfg)
         return StepResult(
             step_number=step,
             name=name,
@@ -552,6 +577,8 @@ def run_step(
         logger.error(
             "[Step %2d/%d] %-28s — ERROR: %s", step, TOTAL_STEPS, name, exc
         )
+        if tracker:
+            tracker.mark_failed(step, str(exc))
         return StepResult(
             step_number=step,
             name=name,
@@ -586,9 +613,9 @@ def run_pipeline(
     config_path : str
         Path to YAML config (forwarded to sub-scripts).
     start_from : int
-        First step to execute (1–11).
+        First step to execute (1–12).
     stop_after : int, optional
-        Last step to execute (default: 11).
+        Last step to execute (default: 12).
     dry_run : bool
         Print commands without executing.
     skip_completed : bool
@@ -633,6 +660,10 @@ def run_pipeline(
         logger.info("Pre-flight checks passed ✓")
 
     pipeline = PipelineResult(start_from=start_from)
+    tracker = PipelineStatusTracker()
+    # Back-fill status from any existing artifacts
+    scan_artifacts_into_status(tracker, cfg)
+
     logger.info("=" * 70)
     logger.info("  FRLM Pipeline — Steps %d → %d  (dry_run=%s)", start_from, stop_after, dry_run)
     logger.info("=" * 70)
@@ -647,6 +678,7 @@ def run_pipeline(
             dry_run=dry_run,
             skip_completed=skip_completed,
             auto_yes=auto_yes,
+            tracker=tracker,
         )
         pipeline.steps.append(result)
 
@@ -700,17 +732,14 @@ def run_pipeline(
 
 
 def print_status(cfg: FRLMConfig) -> None:
-    """Print current pipeline completion status to stdout."""
-    status = get_pipeline_status(cfg)
-    print("\n  FRLM Pipeline Status")
-    print("  " + "-" * 50)
-    for step in range(1, TOTAL_STEPS + 1):
-        done = status[step]
-        icon = "✓" if done else "·"
-        print(f"  {icon}  Step {step:2d}  {STEP_NAMES[step]}")
-    completed = sum(1 for v in status.values() if v)
-    print("  " + "-" * 50)
-    print(f"  {completed}/{TOTAL_STEPS} steps completed\n")
+    """Print current pipeline completion status to stdout.
+
+    Uses the centralized :class:`PipelineStatusTracker` and scans the
+    filesystem for artifacts so the display always reflects reality.
+    """
+    tracker = PipelineStatusTracker()
+    scan_artifacts_into_status(tracker, cfg)
+    tracker.print_status()
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +750,7 @@ def print_status(cfg: FRLMConfig) -> None:
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for the master pipeline script."""
     parser = argparse.ArgumentParser(
-        description="FRLM master pipeline orchestrator — run all 11 steps.",
+        description="FRLM master pipeline orchestrator — run all 12 steps.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -743,7 +772,7 @@ Examples:
         default=1,
         choices=range(1, TOTAL_STEPS + 1),
         metavar="N",
-        help="Step to start/resume from (1–11, default: 1)",
+        help="Step to start/resume from (1–12, default: 1)",
     )
     parser.add_argument(
         "--stop-after",
@@ -751,7 +780,7 @@ Examples:
         default=None,
         choices=range(1, TOTAL_STEPS + 1),
         metavar="N",
-        help="Step to stop after (1–11, default: 11)",
+        help="Step to stop after (1–12, default: 12)",
     )
     parser.add_argument(
         "--dry-run",
