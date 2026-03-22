@@ -134,10 +134,12 @@ make setup-gpu      # GPU (CUDA 11.8)
 # 2. Install & start Neo4j (requires Docker — see "Neo4j Setup" below)
 make setup-neo4j
 
-# 3. Set environment variables
-export FRLM_NEO4J_PASSWORD="frlm_dev_password"   # must match the Neo4j setup
-export ANTHROPIC_API_KEY="sk-ant-..."
-export WANDB_API_KEY="your-key"
+# 3. Set credentials in config/secrets.properties
+cp config/secrets.properties.example config/secrets.properties
+# Then edit config/secrets.properties with your actual values:
+#   neo4j.password=frlm_dev_password
+#   anthropic.api_key=sk-ant-...
+#   wandb.api_key=your-key
 
 # 4. Estimate costs before running (Claude API + GPU hours + storage)
 make estimate-costs
@@ -175,14 +177,14 @@ This will:
 - Pull the `neo4j:5.26.0` Docker image
 - Start a container named `frlm-neo4j` with ports **7474** (HTTP browser) and **7687** (Bolt protocol)
 - Persist data to `./neo4j_data/` so your KG survives container restarts
-- Set the password from `FRLM_NEO4J_PASSWORD` env var (default: `frlm_dev_password`)
+- Set the password from `neo4j.password` in `config/secrets.properties` (default: `frlm_dev_password`)
 - Install the APOC plugin (used for batch operations)
 
 After setup:
 - **Browser UI:** http://localhost:7474
 - **Bolt URI:** `bolt://localhost:7687` (this is what the FRLM code connects to)
 - **Username:** `neo4j`
-- **Password:** whatever you set in `FRLM_NEO4J_PASSWORD`
+- **Password:** whatever you set in `config/secrets.properties`
 
 ### Option B: Native install (apt)
 
@@ -213,14 +215,23 @@ docker rm frlm-neo4j        # Remove container (data persists in neo4j_data/)
 
 ### Configuration
 
-The Neo4j connection settings live in `config/default.yaml`:
+The Neo4j connection settings live in `config/default.yaml`, with sensitive
+values (URI, username, password) overridden from `config/secrets.properties`:
 
 ```yaml
+# config/default.yaml — non-sensitive defaults
 neo4j:
   uri: "bolt://localhost:7687"
   username: "neo4j"
-  password: "CHANGE_ME"          # overridden by FRLM_NEO4J_PASSWORD env var
+  password: "CHANGE_ME"          # overridden by config/secrets.properties
   database: "neo4j"              # Community Edition only supports "neo4j"
+```
+
+```properties
+# config/secrets.properties — your actual credentials (not committed to git)
+neo4j.uri=bolt://localhost:7687
+neo4j.username=neo4j
+neo4j.password=frlm_dev_password
 ```
 
 > **Note:** Neo4j Community Edition only supports the default `neo4j` database.
@@ -234,7 +245,9 @@ neo4j:
 frlm/
 ├── config/
 │   ├── default.yaml              # All hyperparameters — the single source of truth
-│   ├── config.py                 # Pydantic loader with env-var overrides
+│   ├── config.py                 # Pydantic loader with secrets.properties overrides
+│   ├── secrets.properties        # API keys, passwords, Neo4j credentials (git-ignored)
+│   ├── secrets.properties.example # Template for secrets.properties
 │   └── deepspeed_config.json     # ZeRO Stage 2 config for multi-GPU training
 ├── data/
 │   ├── corpus/                   # Raw PMC papers (XML)
@@ -616,13 +629,22 @@ validation checklist with 10 questions:
 
 All hyperparameters live in **`config/default.yaml`** — the single source of truth.
 No magic numbers in source code. The Pydantic config loader (`config/config.py`)
-validates the YAML and supports environment variable overrides for secrets:
+validates the YAML and loads sensitive values from **`config/secrets.properties`**:
 
-| Environment Variable    | Config Field                  | Description |
-|------------------------|-------------------------------|-------------|
-| `FRLM_NEO4J_PASSWORD`  | `neo4j.password`              | Neo4j database password |
-| `ANTHROPIC_API_KEY`     | `extraction.relation.api_key` | Claude API key (for Steps 3 & 6) |
-| `WANDB_API_KEY`         | `wandb.api_key`               | Weights & Biases tracking |
+| Property Key         | Config Field                  | Description |
+|---------------------|-------------------------------|-------------|
+| `neo4j.uri`          | `neo4j.uri`                   | Neo4j Bolt URI |
+| `neo4j.username`     | `neo4j.username`              | Neo4j username |
+| `neo4j.password`     | `neo4j.password`              | Neo4j database password |
+| `anthropic.api_key`  | `extraction.relation.api_key` | Claude API key (for Steps 3 & 6) |
+| `wandb.api_key`      | `wandb.api_key`               | Weights & Biases tracking |
+| `ncbi.api_key`       | *(corpus loader)*             | NCBI E-utilities API key |
+
+To get started, copy the example file and fill in your values:
+
+```bash
+cp config/secrets.properties.example config/secrets.properties
+```
 
 ---
 
