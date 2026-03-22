@@ -372,6 +372,10 @@ class Neo4jConfig(BaseModel):
         if password:
             self.password = password
             logger.info("Neo4j password overridden from secrets.properties")
+        database = secrets.get("neo4j.database")
+        if database:
+            self.database = database
+            logger.info("Neo4j database overridden from secrets.properties")
         return self
 
 
