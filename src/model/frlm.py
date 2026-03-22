@@ -251,6 +251,102 @@ class FRLMModel(nn.Module):
     # Autoregressive generation with interleaved retrieval
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Static helpers for sampling filters
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_repetition_penalty(
+        logits: Tensor,
+        generated_ids: Tensor,
+        penalty: float,
+    ) -> Tensor:
+        """Apply multiplicative repetition penalty (Keskar et al., 2019).
+
+        For every token that already appears in *generated_ids*, divide
+        its logit by *penalty* if positive, or multiply by *penalty* if
+        negative.  ``penalty = 1.0`` is a no-op.
+
+        Parameters
+        ----------
+        logits : Tensor
+            Shape ``(1, vocab_size)``.
+        generated_ids : Tensor
+            Shape ``(1, seq_len)`` — token ids generated so far.
+        penalty : float
+            Repetition penalty factor (> 1.0 to penalise repetition).
+
+        Returns
+        -------
+        Tensor
+            Adjusted logits.
+        """
+        if penalty == 1.0:
+            return logits
+        score = torch.gather(logits, 1, generated_ids)
+        # If score < 0 then multiply by penalty (make more negative)
+        # If score > 0 then divide by penalty (make less positive)
+        score = torch.where(score < 0, score * penalty, score / penalty)
+        logits.scatter_(1, generated_ids, score)
+        return logits
+
+    @staticmethod
+    def _has_repeated_ngram(
+        token_ids: List[int],
+        ngram_size: int,
+    ) -> bool:
+        """Return True if the last *ngram_size* tokens form an n-gram
+        that already appeared earlier in the sequence."""
+        if len(token_ids) < ngram_size * 2:
+            return False
+        last_ngram = tuple(token_ids[-ngram_size:])
+        for i in range(len(token_ids) - ngram_size * 2 + 1):
+            if tuple(token_ids[i : i + ngram_size]) == last_ngram:
+                return True
+        return False
+
+    @staticmethod
+    def _block_repeated_ngrams(
+        logits: Tensor,
+        generated_ids: List[int],
+        ngram_size: int,
+    ) -> Tensor:
+        """Set logits to ``-inf`` for any token that would create a
+        repeated *ngram_size*-gram.
+
+        Parameters
+        ----------
+        logits : Tensor
+            Shape ``(1, vocab_size)``.
+        generated_ids : list of int
+            Tokens generated so far.
+        ngram_size : int
+            N-gram order to block (e.g. 3 for tri-gram blocking).
+
+        Returns
+        -------
+        Tensor
+            Adjusted logits.
+        """
+        if len(generated_ids) < ngram_size:
+            return logits
+        # Collect all n-grams so far (except the incomplete last one)
+        ngrams: dict[tuple[int, ...], list[int]] = {}
+        for i in range(len(generated_ids) - ngram_size + 1):
+            prefix = tuple(generated_ids[i : i + ngram_size - 1])
+            continuation = generated_ids[i + ngram_size - 1]
+            ngrams.setdefault(prefix, []).append(continuation)
+        # The current prefix is the last (ngram_size - 1) tokens
+        current_prefix = tuple(generated_ids[-(ngram_size - 1) :])
+        banned_tokens = ngrams.get(current_prefix, [])
+        if banned_tokens:
+            logits[0, banned_tokens] = float("-inf")
+        return logits
+
+    # ------------------------------------------------------------------
+    # Autoregressive generation with interleaved retrieval
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
     def generate(
         self,
@@ -264,6 +360,8 @@ class FRLMModel(nn.Module):
         top_k: int = 50,
         top_p: float = 0.95,
         retrieval_top_k: int = 10,
+        repetition_penalty: float = 1.2,
+        no_repeat_ngram_size: int = 4,
     ) -> Dict[str, Any]:
         """Autoregressive generation with interleaved retrieval.
 
@@ -295,6 +393,12 @@ class FRLMModel(nn.Module):
             Nucleus (top-p) filtering.
         retrieval_top_k : int
             Number of facts to retrieve per retrieval step.
+        repetition_penalty : float
+            Multiplicative penalty for tokens already generated
+            (1.0 = no penalty, > 1.0 penalises repetition).
+        no_repeat_ngram_size : int
+            Block generation of any n-gram that already appeared in the
+            output (0 = disabled).
 
         Returns
         -------
@@ -312,20 +416,42 @@ class FRLMModel(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(generated)
 
-        for _ in range(max_length - generated.size(1)):
+        # Max context window for positional embeddings (GPT-2 family = 1024)
+        max_ctx = getattr(self.backbone.transformer.config, "n_positions", 1024)
+        prompt_len = input_ids.size(1)
+        gen_steps = 0
+        retrieval_cooldown = 0  # skip retrieval for N steps after a retrieval
+        consecutive_repeat_count = 0  # track consecutive repeated tokens
+        # Track model-generated tokens separately (excludes injected fact
+        # tokens) so n-gram blocking is not disrupted by fact injections.
+        gen_only_tokens: List[int] = []
+
+        while gen_steps < max_length - prompt_len:
+            # Sliding window: only feed the last max_ctx tokens to the backbone
+            if generated.size(1) > max_ctx:
+                ctx_ids = generated[:, -max_ctx:]
+                ctx_mask = attention_mask[:, -max_ctx:]
+            else:
+                ctx_ids = generated
+                ctx_mask = attention_mask
+
             # Forward
-            backbone_out = self.backbone(generated, attention_mask)
+            backbone_out = self.backbone(ctx_ids, ctx_mask)
             hidden = backbone_out.last_hidden_state
 
             # Last position
             last_hidden = hidden[:, -1:, :]  # (1, 1, hid)
 
-            # Router decision
+            # Router decision (suppress retrieval during cooldown)
             router_prob = torch.sigmoid(self.router.forward(last_hidden))  # (1, 1, 1)
-            is_retrieval = (router_prob.item() > self._router_threshold)
+            is_retrieval = (
+                router_prob.item() > self._router_threshold
+                and retrieval_cooldown <= 0
+            )
 
-            if is_retrieval and faiss_index is not None and kg_client is not None:
+            if is_retrieval and faiss_index is not None:
                 router_decisions.append("retrieval")
+                retrieval_cooldown = 3  # generate at least 3 tokens before next retrieval
                 query_sig = self.retrieval_head.forward(last_hidden)
                 facts = self.retrieval_head.resolve(
                     query_sig, faiss_index, kg_client, top_k=retrieval_top_k,
@@ -336,6 +462,7 @@ class FRLMModel(nn.Module):
                 if facts and tokenizer is not None:
                     # Build a fact string: "subject relation object"
                     fact = facts[0]  # use top-1 retrieved fact
+                    fact_text = ""
                     if isinstance(fact, dict):
                         fact_text = " ".join([
                             str(fact.get("subject", "")),
@@ -346,11 +473,10 @@ class FRLMModel(nn.Module):
                         subj = getattr(fact.subject, "label", str(fact.subject))
                         rel = getattr(fact.relation, "type", str(fact.relation))
                         obj = getattr(fact.object, "label", str(fact.object))
-                        fact_text = f"{subj} {rel} {obj}"
-                    else:
-                        fact_text = str(fact)
+                        fact_text = f"{subj} {rel} {obj}".strip()
 
-                    if fact_text:
+                    # Only inject if we have real text (not just a hash ID)
+                    if fact_text and len(fact_text) < 200:
                         fact_tokens = tokenizer.encode(
                             fact_text, add_special_tokens=False
                         )
@@ -371,8 +497,21 @@ class FRLMModel(nn.Module):
                         )
             else:
                 router_decisions.append("generation")
+                retrieval_cooldown = max(0, retrieval_cooldown - 1)
                 logits = self.generation_head.forward(last_hidden)  # (1, 1, vocab)
                 logits = logits[:, -1, :] / temperature  # (1, vocab)
+
+                # --- Repetition penalty ---
+                if repetition_penalty != 1.0:
+                    logits = self._apply_repetition_penalty(
+                        logits, generated, repetition_penalty,
+                    )
+
+                # --- N-gram blocking (uses model-generated tokens only) ---
+                if no_repeat_ngram_size > 0:
+                    logits = self._block_repeated_ngrams(
+                        logits, gen_only_tokens, no_repeat_ngram_size,
+                    )
 
                 # Top-k filtering
                 if top_k > 0:
@@ -400,9 +539,56 @@ class FRLMModel(nn.Module):
                     dim=1,
                 )
 
+                tok = next_token.item()
+                gen_only_tokens.append(tok)
+
+                # --- Early stop on degenerate repetition ---
+                # 1) Same token emitted 6+ times in a row
+                if generated.size(1) > prompt_len + 1:
+                    prev_tok = generated[0, -2].item()
+                    consecutive_repeat_count = (
+                        consecutive_repeat_count + 1 if tok == prev_tok else 0
+                    )
+                    if consecutive_repeat_count >= 5:
+                        logger.warning(
+                            "Aborting generation: token %d repeated %d times",
+                            tok,
+                            consecutive_repeat_count + 1,
+                        )
+                        break
+
+                # 2) Short-pattern loop detector: if a pattern of length
+                #    2-6 tokens has been repeated 4+ times contiguously,
+                #    the model is stuck in a degenerate loop.
+                if len(gen_only_tokens) >= 12:
+                    _abort = False
+                    for pat_len in range(2, 7):
+                        reps_needed = 4
+                        window = reps_needed * pat_len
+                        if len(gen_only_tokens) < window:
+                            continue
+                        tail = gen_only_tokens[-window:]
+                        pattern = tail[:pat_len]
+                        if all(
+                            tail[j] == pattern[j % pat_len]
+                            for j in range(window)
+                        ):
+                            logger.warning(
+                                "Aborting generation: %d-token pattern "
+                                "repeated %d times",
+                                pat_len,
+                                reps_needed,
+                            )
+                            _abort = True
+                            break
+                    if _abort:
+                        break
+
                 # Stop on EOS (token id 50256 for GPT-2 family)
-                if next_token.item() == 50256:
+                if tok == 50256:
                     break
+
+            gen_steps += 1
 
         return {
             "token_ids": generated,

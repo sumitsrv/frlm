@@ -115,7 +115,7 @@ class TestRouterHeadConfig:
         assert 0.0 <= default_config.model.router_head.dropout < 1.0
 
     def test_threshold(self, default_config: FRLMConfig) -> None:
-        assert default_config.model.router_head.threshold == 0.5
+        assert default_config.model.router_head.threshold == 0.3
 
 
 class TestRetrievalHeadConfig:

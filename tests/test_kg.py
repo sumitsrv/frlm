@@ -166,7 +166,7 @@ class TestNeo4jConfig:
         assert default_config.neo4j.uri == "bolt://localhost:7687"
 
     def test_default_database(self, default_config: FRLMConfig) -> None:
-        assert default_config.neo4j.database == "frlm"
+        assert default_config.neo4j.database == "neo4j"
 
     def test_batch_settings(self, default_config: FRLMConfig) -> None:
         assert default_config.neo4j.batch.import_batch_size == 5000
@@ -407,7 +407,7 @@ class TestNeo4jClientConstruction:
     def test_from_config(self, default_config: FRLMConfig) -> None:
         client = Neo4jClient.from_config(default_config)
         assert client._uri == "bolt://localhost:7687"
-        assert client._database == "frlm"
+        assert client._database == "neo4j"
         assert client._entity_label == "Entity"
         assert client._fact_label == "Fact"
         assert client._version_chain_type == "SUPERSEDES"

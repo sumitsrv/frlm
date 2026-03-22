@@ -774,8 +774,9 @@ class InferenceConfig(BaseModel):
     top_p: float = 0.95
     do_sample: bool = True
     num_beams: int = 1
-    repetition_penalty: float = 1.1
-    router_threshold: float = 0.5
+    repetition_penalty: float = 1.3
+    no_repeat_ngram_size: int = 4
+    router_threshold: float = 0.3
     batch_size: int = 1
 
 

@@ -240,14 +240,31 @@ class RetrievalHead(nn.Module):
         # Extract fact ids
         fact_ids = [fact_id for fact_id, _score in results]
 
-        # Temporal filtering via KG client
-        resolved: List[Any] = []
-        for fid in fact_ids:
-            fact = kg_client.get_fact_by_id(fid)
-            if fact is not None:
-                resolved.append(fact)
+        # Temporal filtering via KG client (if available)
+        if kg_client is not None:
+            resolved: List[Any] = []
+            for fid in fact_ids:
+                fact = kg_client.get_fact_by_id(fid)
+                if fact is not None:
+                    resolved.append(fact)
+            return resolved
 
-        return resolved
+        # No KG client — return lightweight fact stubs from FAISS results
+        # so that retrieval can still function without a live Neo4j instance.
+        from dataclasses import dataclass as _dc
+
+        @_dc
+        class _FactStub:
+            fact_id: str
+            score: float
+            subject: str = ""
+            relation: str = ""
+            object: str = ""
+
+            def __str__(self) -> str:
+                return self.fact_id
+
+        return [_FactStub(fact_id=fid, score=sc) for fid, sc in results]
 
     # ------------------------------------------------------------------
     # Factory

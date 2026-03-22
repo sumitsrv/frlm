@@ -186,7 +186,7 @@ class TestEnvironmentOverrides:
         env.pop("FRLM_NEO4J_PASSWORD", None)
         with patch.dict(os.environ, env, clear=True):
             cfg = load_config()
-            assert cfg.neo4j.password == "CHANGE_ME"
+            assert cfg.neo4j.password == "frlm_dev_password"
 
     def test_wandb_api_key_override(self) -> None:
         with patch.dict(os.environ, {"WANDB_API_KEY": "wb_key_xyz"}):
@@ -368,7 +368,7 @@ class TestRelationType:
     """Validate RelationType enum and Relation model."""
 
     def test_all_30_types_defined(self) -> None:
-        assert len(RelationType) == 30
+        assert len(RelationType) == 32
 
     def test_string_coercion(self) -> None:
         r = Relation(type="treats")
@@ -391,7 +391,7 @@ class TestRelationType:
             "PART_OF", "PRECURSOR_OF", "ANALOG_OF", "TARGET_OF",
             "INDUCES", "PREVENTS", "DIAGNOSES", "PROGNOSTIC_FOR",
             "RESISTANT_TO", "SENSITIVE_TO", "INTERACTS_WITH", "TRANSPORTS",
-            "CATALYZES", "ENCODES",
+            "CATALYZES", "ENCODES", "DOSAGE_OF", "RESISTANCE_TO",
         ]
         assert [rt.value for rt in RelationType] == expected
 

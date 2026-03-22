@@ -228,7 +228,7 @@ class TestInferencePipelineConstruction:
         assert pipeline.temperature == 0.7
         assert pipeline.top_k == 50
         assert pipeline.top_p == 0.95
-        assert pipeline.router_threshold == 0.5
+        assert pipeline.router_threshold == 0.3
         assert pipeline.device == "cpu"
 
     def test_custom_config(self) -> None:

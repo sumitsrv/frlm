@@ -483,6 +483,16 @@ class RetrievalEvaluator:
         for batch in dataloader:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
+
+            # ground_truth_fact_ids is required for retrieval evaluation.
+            # Datasets that lack this field (e.g. RouterDataset) cannot be
+            # used for retrieval metrics — skip the batch gracefully.
+            if "ground_truth_fact_ids" not in batch:
+                logger.debug(
+                    "Batch missing 'ground_truth_fact_ids' — skipping "
+                    "(dataloader may not contain retrieval annotations)."
+                )
+                continue
             gt_fact_ids_batch: List[List[str]] = batch["ground_truth_fact_ids"]
 
             # Forward through backbone + retrieval head
@@ -550,6 +560,14 @@ class RetrievalEvaluator:
 
             if max_samples and sample_count >= max_samples:
                 break
+
+        if sample_count == 0:
+            logger.warning(
+                "Retrieval evaluation produced 0 samples — the dataloader "
+                "may lack 'ground_truth_fact_ids' annotations. "
+                "Use a RetrievalDataset or add fact-id annotations to "
+                "evaluate retrieval metrics."
+            )
 
         results = accumulator.compute()
         logger.info(

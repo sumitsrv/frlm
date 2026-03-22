@@ -638,10 +638,10 @@ class TestValidateLabels:
         assert any("too low" in i.lower() for i in issues)
 
     def test_ratio_too_high(self) -> None:
-        # 100-char text, 80 chars factual = 0.80 ratio > 0.70
+        # 100-char text, 90 chars factual = 0.90 ratio > 0.85 (default max)
         spans = [
-            _make_span(0, 80, "f" * 80, "factual", 0.9),
-            _make_span(80, 100, "l" * 20, "linguistic", 0.9),
+            _make_span(0, 90, "f" * 90, "factual", 0.9),
+            _make_span(90, 100, "l" * 10, "linguistic", 0.9),
         ]
         is_valid, issues = LabelValidator.validate_labels(spans, 100)
         assert is_valid is False

@@ -164,16 +164,18 @@ class InferencePipeline:
             self.top_k = getattr(config, "top_k", 50)
             self.top_p = getattr(config, "top_p", 0.95)
             self.do_sample = getattr(config, "do_sample", True)
-            self.repetition_penalty = getattr(config, "repetition_penalty", 1.1)
-            self.router_threshold = getattr(config, "router_threshold", 0.5)
+            self.repetition_penalty = getattr(config, "repetition_penalty", 1.3)
+            self.no_repeat_ngram_size = getattr(config, "no_repeat_ngram_size", 4)
+            self.router_threshold = getattr(config, "router_threshold", 0.3)
         else:
             self.max_length = 512
             self.temperature = 0.7
             self.top_k = 50
             self.top_p = 0.95
             self.do_sample = True
-            self.repetition_penalty = 1.1
-            self.router_threshold = 0.5
+            self.repetition_penalty = 1.3
+            self.no_repeat_ngram_size = 4
+            self.router_threshold = 0.3
 
         # Move model to device
         self.model.to(self.device)
@@ -276,16 +278,22 @@ class InferencePipeline:
         input_ids = encoded["input_ids"].to(self.device)
         attention_mask = encoded["attention_mask"].to(self.device)
 
+        # Override model's router threshold with the pipeline's setting
+        self.model.router_threshold = _threshold
+
         # Generate using FRLMModel.generate()
         gen_output = self.model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_new_tokens=_max_length - input_ids.size(1),
+            max_length=_max_length,
             temperature=_temperature,
             top_k=_top_k,
             top_p=_top_p,
             faiss_index=self.faiss_index,
             kg_client=self.kg_client,
+            tokenizer=self.tokenizer,
+            repetition_penalty=self.repetition_penalty,
+            no_repeat_ngram_size=self.no_repeat_ngram_size,
         )
 
         # Parse model output
@@ -385,48 +393,57 @@ class InferencePipeline:
     # ------------------------------------------------------------------
 
     def _convert_facts(self, raw_facts: List[Any]) -> List[RetrievedFact]:
-        """Convert raw facts from model.generate() to structured format."""
+        """Convert raw facts from model.generate() to structured format.
+
+        ``raw_facts`` from ``model.generate()`` is a list of lists — one
+        inner list per retrieval step.  We flatten and convert each fact.
+        """
         converted: List[RetrievedFact] = []
-        for fact in raw_facts:
-            if hasattr(fact, "fact_id"):
-                # Pydantic Fact object
-                converted.append(
-                    RetrievedFact(
-                        fact_id=getattr(fact, "fact_id", ""),
-                        subject_label=getattr(fact.subject, "label", "")
-                        if hasattr(fact, "subject")
-                        else "",
-                        relation_type=fact.relation.type.value
-                        if hasattr(fact, "relation") and hasattr(fact.relation, "type")
-                        else "",
-                        object_label=getattr(fact.object, "label", "")
-                        if hasattr(fact, "object")
-                        else "",
-                        confidence=getattr(fact, "confidence", 0.0),
-                        temporal_mode="CURRENT"
-                        if getattr(fact, "is_current", True)
-                        else "HISTORY",
-                        valid_from=str(fact.temporal.valid_from)
-                        if hasattr(fact, "temporal")
-                        else None,
-                        valid_to=str(fact.temporal.valid_to)
-                        if hasattr(fact, "temporal") and fact.temporal.valid_to
-                        else None,
-                        source=getattr(fact, "source", ""),
-                    )
-                )
-            elif isinstance(fact, dict):
+
+        # Flatten: raw_facts may be List[List[fact]] or List[fact]
+        flat_facts: List[Any] = []
+        for item in raw_facts:
+            if isinstance(item, list):
+                flat_facts.extend(item)
+            else:
+                flat_facts.append(item)
+
+        for fact in flat_facts:
+            if isinstance(fact, dict):
                 converted.append(
                     RetrievedFact(
                         fact_id=fact.get("fact_id", ""),
-                        subject_label=fact.get("subject_label", ""),
-                        relation_type=fact.get("relation_type", ""),
-                        object_label=fact.get("object_label", ""),
-                        confidence=fact.get("confidence", 0.0),
+                        subject_label=fact.get("subject_label", fact.get("subject", "")),
+                        relation_type=fact.get("relation_type", fact.get("relation", "")),
+                        object_label=fact.get("object_label", fact.get("object", "")),
+                        confidence=fact.get("confidence", fact.get("score", 0.0)),
                         temporal_mode=fact.get("temporal_mode", "CURRENT"),
                         valid_from=fact.get("valid_from"),
                         valid_to=fact.get("valid_to"),
                         source=fact.get("source", ""),
+                    )
+                )
+            elif hasattr(fact, "fact_id"):
+                # Could be a full Pydantic Fact or a lightweight _FactStub
+                fid = getattr(fact, "fact_id", "")
+                # Check if subject is a nested object or a plain string
+                subj_raw = getattr(fact, "subject", "")
+                subj = getattr(subj_raw, "label", str(subj_raw)) if subj_raw else ""
+                rel_raw = getattr(fact, "relation", "")
+                rel = getattr(rel_raw, "type", str(rel_raw)) if rel_raw else ""
+                if hasattr(rel, "value"):
+                    rel = rel.value  # enum
+                obj_raw = getattr(fact, "object", "")
+                obj = getattr(obj_raw, "label", str(obj_raw)) if obj_raw else ""
+                conf = getattr(fact, "confidence", getattr(fact, "score", 0.0))
+                converted.append(
+                    RetrievedFact(
+                        fact_id=fid,
+                        subject_label=subj,
+                        relation_type=rel,
+                        object_label=obj,
+                        confidence=conf,
+                        temporal_mode="CURRENT",
                     )
                 )
         return converted
@@ -439,27 +456,52 @@ class InferencePipeline:
         """Convert raw router decisions to structured format."""
         converted: List[RouterDecision] = []
         for i, decision in enumerate(raw_decisions):
-            if isinstance(decision, dict):
+            if isinstance(decision, str):
+                # model.generate() returns "retrieval" / "generation" strings
+                is_retrieval = decision == "retrieval"
+                converted.append(
+                    RouterDecision(
+                        step=i,
+                        probability=1.0 if is_retrieval else 0.0,
+                        decision=decision,
+                        num_facts_retrieved=1 if is_retrieval else 0,
+                    )
+                )
+            elif isinstance(decision, dict):
                 prob = decision.get("probability", decision.get("prob", 0.0))
                 is_retrieval = decision.get("retrieval", prob >= threshold)
                 n_facts = decision.get("num_facts", 0)
+                converted.append(
+                    RouterDecision(
+                        step=i,
+                        probability=prob,
+                        decision="retrieval" if is_retrieval else "generation",
+                        num_facts_retrieved=n_facts,
+                    )
+                )
             elif isinstance(decision, (float, int)):
                 prob = float(decision)
                 is_retrieval = prob >= threshold
-                n_facts = 0
+                converted.append(
+                    RouterDecision(
+                        step=i,
+                        probability=prob,
+                        decision="retrieval" if is_retrieval else "generation",
+                        num_facts_retrieved=0,
+                    )
+                )
             else:
                 prob = float(getattr(decision, "probability", 0.0))
                 is_retrieval = prob >= threshold
                 n_facts = getattr(decision, "num_facts", 0)
-
-            converted.append(
-                RouterDecision(
-                    step=i,
-                    probability=prob,
-                    decision="retrieval" if is_retrieval else "generation",
-                    num_facts_retrieved=n_facts,
+                converted.append(
+                    RouterDecision(
+                        step=i,
+                        probability=prob,
+                        decision="retrieval" if is_retrieval else "generation",
+                        num_facts_retrieved=n_facts,
+                    )
                 )
-            )
         return converted
 
     def warmup(self, warmup_text: str = "Biomedical warmup query.") -> None:

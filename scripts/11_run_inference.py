@@ -32,23 +32,73 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 
 
+def _find_latest_training_checkpoint(cfg: FRLMConfig) -> Optional[Path]:
+    """Find the latest model.pt from training checkpoints."""
+    try:
+        ckpt_base = Path(cfg.training.output_dir)
+    except Exception:
+        ckpt_base = cfg.paths.resolve("checkpoints_dir")
+
+    for phase_dir in ["phase3_joint", "phase2_retrieval", "phase1_router"]:
+        phase_path = ckpt_base / phase_dir
+        if phase_path.exists():
+            ckpt_dirs = sorted([d for d in phase_path.iterdir() if d.is_dir()])
+            if ckpt_dirs:
+                model_pt = ckpt_dirs[-1] / "model.pt"
+                if model_pt.exists():
+                    return model_pt
+    return None
+
+
 def _load_model(cfg: FRLMConfig) -> Any:
-    """Load the trained FRLM model from the latest joint checkpoint."""
+    """Load the trained FRLM model from the latest checkpoint."""
+    import torch
     from src.model.frlm import FRLMModel
 
-    checkpoint_dir = cfg.paths.resolve("checkpoints_dir") / "joint"
-    logger.info("Loading FRLM model from %s", checkpoint_dir)
-    logger.info("Backbone: %s", cfg.model.backbone.name)
-    logger.info("Device: %s, Dtype: %s", cfg.inference.device, cfg.inference.dtype)
+    # Resolve device: fall back to CPU when CUDA is requested but unavailable
+    device = cfg.inference.device
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("CUDA unavailable — falling back to CPU for inference")
+        device = "cpu"
 
-    if checkpoint_dir.exists():
-        model = FRLMModel.from_pretrained(str(checkpoint_dir), device=cfg.inference.device)
-    else:
-        logger.warning("Checkpoint not found — building from config")
+    # Try save_pretrained format first
+    ckpt_dir = cfg.paths.resolve("checkpoints_dir") / "joint"
+    if ckpt_dir.exists() and (ckpt_dir / "config.json").exists():
+        logger.info("Loading model from save_pretrained: %s", ckpt_dir)
+        model = FRLMModel.from_pretrained(str(ckpt_dir), device=device)
+        model.eval()
+        return model
+
+    # Find latest training checkpoint
+    model_pt = _find_latest_training_checkpoint(cfg)
+    if model_pt is not None:
+        logger.info("Loading trained weights from %s", model_pt)
+        logger.info("Backbone: %s", cfg.model.backbone.name)
+        logger.info("Device: %s, Dtype: %s", device, cfg.inference.dtype)
         model = FRLMModel.from_config(cfg)
+        state_dict = torch.load(str(model_pt), map_location=device)
+        try:
+            model.load_state_dict(state_dict, strict=False)
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                logger.error(
+                    "Checkpoint shape mismatch — the checkpoint at %s was "
+                    "likely trained with a different backbone/config than "
+                    "the current one (%s). If you trained with "
+                    "config/test.yaml (GPT-2), re-run with "
+                    "--config config/test.yaml.",
+                    model_pt, cfg.model.backbone.name,
+                )
+            raise
+        logger.info("Trained weights loaded from %s", model_pt.parent.name)
+        model.eval()
+        return model
 
+    # Fallback
+    logger.warning("No checkpoint found — building model with random weights")
+    logger.info("Backbone: %s", cfg.model.backbone.name)
+    model = FRLMModel.from_config(cfg)
     model.eval()
-    logger.info("Model loaded successfully")
     return model
 
 
@@ -65,24 +115,29 @@ def _load_tokenizer(cfg: FRLMConfig) -> Any:
 
 def _load_faiss_index(cfg: FRLMConfig) -> Any:
     """Load the FAISS index for retrieval."""
+    from src.embeddings.faiss_index import FAISSFactIndex
+
     index_dir = cfg.paths.resolve("faiss_index_dir")
     level = cfg.faiss.hierarchical.default_level
     level_name = getattr(cfg.faiss.hierarchical, f"level_{level}")
-    index_path = index_dir / f"index_level_{level}_{level_name}.faiss"
+    index_base = index_dir / f"level_{level}_{level_name}"
+    faiss_path = index_base.with_suffix(".faiss")
 
-    if not index_path.exists():
-        logger.warning("FAISS index not found at %s", index_path)
+    if not faiss_path.exists():
+        logger.warning("FAISS index not found at %s", faiss_path)
         return None
 
-    import faiss
-
-    index = faiss.read_index(str(index_path))
-    if cfg.faiss.use_gpu:
-        res = faiss.StandardGpuResources()
-        index = faiss.index_cpu_to_gpu(res, cfg.faiss.gpu_id, index)
-    index.nprobe = cfg.faiss.nprobe
-    logger.info("FAISS index loaded: %s (%d vectors)", index_path, index.ntotal)
-    return index
+    fact_index = FAISSFactIndex(
+        embedding_dim=cfg.faiss.embedding_dim,
+        index_type=cfg.faiss.index_type,
+        metric=cfg.faiss.metric,
+        nprobe=cfg.faiss.nprobe,
+        use_gpu=cfg.faiss.use_gpu,
+        gpu_id=cfg.faiss.gpu_id,
+    )
+    fact_index.load_index(index_base)
+    logger.info("FAISS index loaded: %s (%d vectors)", faiss_path, fact_index.ntotal)
+    return fact_index
 
 
 def _load_kg_client(cfg: FRLMConfig) -> Any:
@@ -90,7 +145,8 @@ def _load_kg_client(cfg: FRLMConfig) -> Any:
     from src.kg.neo4j_client import Neo4jClient
 
     try:
-        client = Neo4jClient.from_config(cfg.neo4j)
+        client = Neo4jClient.from_config(cfg)
+        client.connect()
         logger.info("KG client connected: %s", cfg.neo4j.uri)
         return client
     except Exception as e:
