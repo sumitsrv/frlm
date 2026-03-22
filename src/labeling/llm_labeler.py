@@ -74,18 +74,41 @@ class SpanLabel(BaseModel):
 class CostTracker:
     """Accumulates API usage for cost estimation.
 
-    Pricing (Claude 3.5 Sonnet as of 2025):
-        * Input : $3.00 / 1 M tokens
-        * Output: $15.00 / 1 M tokens
+    Pricing is model-aware (per 1 M tokens, as of 2025-Q1):
+
+    ============================  =========  ==========
+    Model                         Input $/M  Output $/M
+    ============================  =========  ==========
+    claude-sonnet-4-6      3.00       15.00
+    claude-haiku-4-5-*            1.00        5.00
+    claude-3-haiku-*              0.25        1.25
+    ============================  =========  ==========
     """
 
-    INPUT_COST_PER_TOKEN = 3.00 / 1_000_000
-    OUTPUT_COST_PER_TOKEN = 15.00 / 1_000_000
+    _PRICING: Dict[str, Tuple[float, float]] = {
+        # (input $/M tokens, output $/M tokens)
+        "sonnet": (3.00, 15.00),
+        "haiku-4-5": (1.00, 5.00),
+        "haiku-3": (0.25, 1.25),
+    }
 
-    def __init__(self) -> None:
+    def __init__(self, model: str = "") -> None:
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
         self.total_requests: int = 0
+        inp, out = self._resolve_pricing(model)
+        self.INPUT_COST_PER_TOKEN = inp / 1_000_000
+        self.OUTPUT_COST_PER_TOKEN = out / 1_000_000
+
+    @classmethod
+    def _resolve_pricing(cls, model: str) -> Tuple[float, float]:
+        m = model.lower()
+        if "haiku" in m and ("4-5" in m or "4.5" in m):
+            return cls._PRICING["haiku-4-5"]
+        if "haiku" in m:
+            return cls._PRICING["haiku-3"]
+        # Default to Sonnet pricing (safe upper bound)
+        return cls._PRICING["sonnet"]
 
     def record(self, input_tokens: int, output_tokens: int) -> None:
         self.total_input_tokens += input_tokens
@@ -201,6 +224,24 @@ def _build_user_message(text: str) -> str:
     )
 
 
+def _build_batch_user_message(texts: List[str]) -> str:
+    """Build a user message that asks Claude to label multiple texts at once.
+
+    Each text is given a numeric ID so the response can be matched back.
+    Expected response format:  ``{"results": {"0": [...], "1": [...], ...}}``
+    """
+    lines = [
+        f"{FEW_SHOT_EXAMPLES}\n\n---\n\n"
+        "Now annotate **each** of the following texts.  "
+        "Return a JSON object with a single key `\"results\"` whose value is "
+        "an object mapping each text ID (string) to its annotation array.  "
+        "Return **only** the JSON object, nothing else.\n"
+    ]
+    for idx, text in enumerate(texts):
+        lines.append(f'\nText {idx}:\n```\n{text}\n```')
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # LLMLabeler
 # ---------------------------------------------------------------------------
@@ -250,7 +291,7 @@ class LLMLabeler:
         self._min_interval = 60.0 / max(rate_limit_rpm, 1)
         self._last_request_time: float = 0.0
         self.tokenizer_name = tokenizer_name
-        self.cost_tracker = CostTracker()
+        self.cost_tracker = CostTracker(model=self.model)
         self._client: Any = None  # lazily initialised
 
     # ------------------------------------------------------------------
@@ -431,6 +472,172 @@ class LLMLabeler:
 
         raw = self._call_api(text)
         return self._parse_response(raw, text)
+
+    # ------------------------------------------------------------------
+    # Batch labeling — multiple texts per API call
+    # ------------------------------------------------------------------
+
+    def _call_api_batch(self, texts: List[str]) -> str:
+        """Call Claude with a batch message containing multiple texts."""
+        client = self._get_client()
+        user_message = _build_batch_user_message(texts)
+
+        for attempt in range(1, self.max_retries + 1):
+            self._rate_limit()
+            try:
+                response = client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": user_message}],
+                )
+                usage = getattr(response, "usage", None)
+                if usage:
+                    self.cost_tracker.record(
+                        input_tokens=getattr(usage, "input_tokens", 0),
+                        output_tokens=getattr(usage, "output_tokens", 0),
+                    )
+                return response.content[0].text
+            except Exception as exc:
+                logger.warning(
+                    "Batch API call attempt %d/%d failed: %s",
+                    attempt, self.max_retries, exc,
+                )
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_delay * attempt)
+
+        raise RuntimeError(
+            f"All {self.max_retries} batch API attempts failed "
+            f"({len(texts)} texts)"
+        )
+
+    @staticmethod
+    def _parse_batch_response(
+        raw: str, texts: List[str]
+    ) -> Dict[int, List[SpanLabel]]:
+        """Parse a batch response mapping text IDs → span labels.
+
+        Expected JSON: ``{"results": {"0": [...], "1": [...], ...}}``
+        Falls back to single-array format for single-text batches.
+        """
+        # Strip markdown fences if present
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw, re.DOTALL)
+        text_body = match.group(1) if match else raw.strip()
+
+        try:
+            parsed = json.loads(text_body)
+        except json.JSONDecodeError:
+            # Try finding the outermost { ... }
+            brace = re.search(r"\{.*\}", text_body, re.DOTALL)
+            if brace:
+                parsed = json.loads(brace.group(0))
+            else:
+                raise
+
+        results: Dict[int, List[SpanLabel]] = {}
+
+        # Format: {"results": {"0": [...], "1": [...]}}
+        if isinstance(parsed, dict) and "results" in parsed:
+            for key, items in parsed["results"].items():
+                idx = int(key)
+                if idx < len(texts):
+                    results[idx] = LLMLabeler._parse_response_items(
+                        items, texts[idx]
+                    )
+        # Fallback for single-text batch returning bare array
+        elif isinstance(parsed, list) and len(texts) == 1:
+            results[0] = LLMLabeler._parse_response_items(parsed, texts[0])
+        else:
+            logger.warning("Unexpected batch response structure; returning empty")
+
+        return results
+
+    @staticmethod
+    def _parse_response_items(
+        items: List[Dict[str, Any]], original_text: str,
+    ) -> List[SpanLabel]:
+        """Shared helper: convert a list of raw dicts into SpanLabels."""
+        labels: List[SpanLabel] = []
+        search_start = 0
+        for item in items:
+            span_text: str = item.get("span", "")
+            label: str = item.get("label", "linguistic")
+            confidence: float = float(item.get("confidence", 0.5))
+
+            label_lower = label.lower().strip()
+            if label_lower in ("factual", "retrieval"):
+                label_lower = "factual"
+            elif label_lower in ("linguistic", "generation"):
+                label_lower = "linguistic"
+            else:
+                label_lower = "linguistic"
+
+            idx = original_text.find(span_text, search_start)
+            if idx == -1:
+                idx = original_text.lower().find(span_text.lower(), search_start)
+            if idx == -1:
+                idx = original_text.find(span_text)
+            if idx == -1:
+                continue
+
+            end_idx = idx + len(span_text)
+            labels.append(SpanLabel(
+                start_char=idx,
+                end_char=end_idx,
+                text=span_text,
+                label=label_lower,  # type: ignore[arg-type]
+                confidence=min(max(confidence, 0.0), 1.0),
+            ))
+            search_start = end_idx
+        return labels
+
+    def label_texts_batch(
+        self, texts: List[str], *, api_batch_size: int = 50,
+    ) -> List[List[SpanLabel]]:
+        """Label multiple texts using batched API calls.
+
+        Groups *texts* into chunks of *api_batch_size* and sends each
+        chunk in a single API call, dramatically reducing per-text
+        prompt overhead.
+
+        Parameters
+        ----------
+        texts : List[str]
+            Texts to label.
+        api_batch_size : int
+            How many texts to pack into one API call.
+
+        Returns
+        -------
+        List[List[SpanLabel]]
+            One list of span labels per input text (same order).
+        """
+        all_results: List[List[SpanLabel]] = [[] for _ in texts]
+
+        for batch_start in range(0, len(texts), api_batch_size):
+            batch = texts[batch_start:batch_start + api_batch_size]
+            non_empty = [(i, t) for i, t in enumerate(batch) if t.strip()]
+
+            if not non_empty:
+                continue
+
+            batch_texts = [t for _, t in non_empty]
+            try:
+                raw = self._call_api_batch(batch_texts)
+                parsed = self._parse_batch_response(raw, batch_texts)
+            except Exception as exc:
+                logger.error(
+                    "Batch labeling failed for %d texts: %s",
+                    len(batch_texts), exc,
+                )
+                parsed = {}
+
+            for local_idx, (orig_idx, _) in enumerate(non_empty):
+                spans = parsed.get(local_idx, [])
+                all_results[batch_start + orig_idx] = spans
+
+        return all_results
 
     # ------------------------------------------------------------------
     # Token alignment

@@ -425,6 +425,10 @@ class LabelingConfig(BaseModel):
     system_prompt: str = ""
     validation: LabelValidationConfig = Field(default_factory=LabelValidationConfig)
 
+    # --- Cost-reduction options ---
+    use_heuristic: bool = True        # heuristic pre-labeling for obvious cases
+    api_batch_size: int = 50          # texts per API call (1 = legacy, 50 = recommended)
+
     @model_validator(mode="after")
     def override_api_key_from_env(self) -> "LabelingConfig":
         env_key = os.environ.get("ANTHROPIC_API_KEY")

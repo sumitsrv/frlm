@@ -224,6 +224,11 @@ labeling:
   rate_limit_rpm: 50
   inter_annotator_samples: 200      # samples for IAA measurement
   min_agreement_threshold: 0.8      # Cohen's kappa minimum
+
+  # --- Cost-reduction options (added 2026-03) ---
+  use_heuristic: true               # label obvious entities/function-words locally (no API)
+  api_batch_size: 50                # texts per API call (was 1; 50 = ~50× less overhead)
+
   system_prompt: |
     You are annotating biomedical text for a factual retrieval language model.
     For each token span, classify it as:

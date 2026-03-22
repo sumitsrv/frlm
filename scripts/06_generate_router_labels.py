@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.config import FRLMConfig, load_config, setup_logging
 from src.labeling.llm_labeler import LLMLabeler, SpanLabel
+from src.labeling.heuristic_labeler import HeuristicLabeler
 from src.labeling.label_validator import LabelValidator
 from src.status import PipelineStatusTracker
 
@@ -82,20 +83,44 @@ def estimate_cost(
 
     Rough heuristic: ~1 token ≈ 4 chars for input;
     output ≈ 25 % of input tokens.
+    Accounts for heuristic pre-labeling and multi-text batching.
     """
-    avg_input_tokens = avg_text_length / 4   # text tokens
-    avg_input_tokens += 800                   # system + few-shot prompt overhead
-    avg_output_tokens = avg_input_tokens * 0.25
+    # Model-aware pricing
+    model_lower = cfg_labeling.model.lower()
+    if "haiku" in model_lower and ("4-5" in model_lower or "4.5" in model_lower):
+        input_price, output_price = 1.00, 5.00
+    elif "haiku" in model_lower:
+        input_price, output_price = 0.25, 1.25
+    else:
+        input_price, output_price = 3.00, 15.00
 
-    total_input = int(avg_input_tokens * total_texts)
-    total_output = int(avg_output_tokens * total_texts)
+    # Account for heuristic pre-labeling
+    use_heuristic = getattr(cfg_labeling, "use_heuristic", False)
+    api_batch_size = getattr(cfg_labeling, "api_batch_size", 1)
+    heuristic_ratio = 0.55 if use_heuristic else 0.0  # ~55% handled locally
+    api_texts = int(total_texts * (1 - heuristic_ratio))
 
-    input_cost = total_input * 3.00 / 1_000_000
-    output_cost = total_output * 15.00 / 1_000_000
+    # With batching, prompt overhead is shared across batch
+    num_api_calls = max(1, api_texts // max(api_batch_size, 1))
+    prompt_overhead_tokens = 1250  # system + few-shot per call
+    text_tokens_per_text = avg_text_length / 4
+
+    total_input = int(
+        num_api_calls * prompt_overhead_tokens
+        + api_texts * text_tokens_per_text
+    )
+    total_output = int(api_texts * 8)  # ~8 tokens per short text response
+
+    input_cost = total_input * input_price / 1_000_000
+    output_cost = total_output * output_price / 1_000_000
     total_cost = input_cost + output_cost
 
     return {
         "total_texts": total_texts,
+        "texts_heuristic": total_texts - api_texts,
+        "texts_api": api_texts,
+        "api_calls": num_api_calls,
+        "api_batch_size": api_batch_size,
         "avg_text_length_chars": avg_text_length,
         "estimated_input_tokens": total_input,
         "estimated_output_tokens": total_output,
@@ -157,11 +182,19 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
         with open(est_path, "w") as fh:
             json.dump(cost_est, fh, indent=2)
 
-    # -- 3. Label each file ----------------------------------------------
+    # -- 3. Label each file (hybrid: heuristic → batch-LLM) ---------------
+    use_heuristic = getattr(labeling_cfg, "use_heuristic", True)
+    api_batch_size = getattr(labeling_cfg, "api_batch_size", 50)
+
     labeler = LLMLabeler.from_config(labeling_cfg)
+    heuristic = HeuristicLabeler() if use_heuristic else None
     validator = LabelValidator()
     tracker = PipelineStatusTracker()
     tracker.mark_running(6, total_items=len(chunk_files))
+
+    if use_heuristic:
+        logger.info("Heuristic pre-labeling ENABLED — obvious spans handled locally")
+    logger.info("API batch size: %d texts per call", api_batch_size)
 
     start_time = time.time()
     total_labeled = 0
@@ -169,6 +202,8 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
     total_invalid = 0
     completed_files = 0
     skipped_files = 0
+    heuristic_count = 0
+    api_count = 0
     all_spans: List[SpanLabel] = []
     review_records: List[Dict[str, Any]] = []
 
@@ -189,19 +224,53 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
             texts = _load_texts_from_file(chunk_path)
             file_spans: List[SpanLabel] = []
 
-            for text in texts:
+            # --- Phase A: heuristic pre-labeling --------------------------
+            needs_llm_indices: List[int] = []   # indices into `texts`
+            needs_llm_texts: List[str] = []
+
+            for i, text in enumerate(texts):
                 if not text.strip():
                     continue
+
+                if heuristic is not None:
+                    span = heuristic.try_label(text)
+                    if span is not None:
+                        file_spans.append(span)
+                        heuristic_count += 1
+                        continue
+
+                # Deferred to LLM
+                needs_llm_indices.append(i)
+                needs_llm_texts.append(text)
+
+            # --- Phase B: batch LLM labeling for remaining texts ----------
+            if needs_llm_texts:
                 try:
-                    spans = labeler.label_text(text)
+                    batch_results = labeler.label_texts_batch(
+                        needs_llm_texts, api_batch_size=api_batch_size,
+                    )
+                    for j, spans in enumerate(batch_results):
+                        file_spans.extend(spans)
+                    api_count += len(needs_llm_texts)
                 except Exception as exc:
                     logger.error(
-                        "Labeling failed for text in %s: %s",
+                        "Batch labeling failed for %s: %s",
                         chunk_path.name, exc,
                     )
-                    spans = []
-                file_spans.extend(spans)
-                all_spans.extend(spans)
+                    # Fallback: label remaining one-by-one
+                    for text in needs_llm_texts:
+                        try:
+                            spans = labeler.label_text(text)
+                        except Exception as inner_exc:
+                            logger.error(
+                                "Fallback labeling failed in %s: %s",
+                                chunk_path.name, inner_exc,
+                            )
+                            spans = []
+                        file_spans.extend(spans)
+                        api_count += 1
+
+            all_spans.extend(file_spans)
 
             # Validate
             text_length = sum(len(t) for t in texts)
@@ -250,10 +319,13 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
 
         if file_idx % 10 == 0 or file_idx == len(chunk_files):
             logger.info(
-                "Progress: %d/%d files, %d spans, %d valid, %d invalid, cost $%.4f",
+                "Progress: %d/%d files | %d spans | heuristic %d, api %d | "
+                "valid %d, invalid %d | cost $%.4f",
                 file_idx,
                 len(chunk_files),
                 total_labeled,
+                heuristic_count,
+                api_count,
                 total_valid,
                 total_invalid,
                 labeler.cost_tracker.estimated_cost_usd,
@@ -288,7 +360,11 @@ def generate_labels(cfg: FRLMConfig, *, max_files: Optional[int] = None) -> None
     stats["files_total"] = len(chunk_files)
     stats["files_valid"] = total_valid
     stats["files_invalid"] = total_invalid
+    stats["heuristic_labeled"] = heuristic_count
+    stats["api_labeled"] = api_count
     stats["cost"] = labeler.cost_tracker.summary()
+    if heuristic is not None:
+        stats["heuristic_stats"] = heuristic.stats
 
     stats_path = labels_dir / "label_statistics.json"
     with open(stats_path, "w") as fh:
