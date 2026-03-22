@@ -12,19 +12,38 @@
 #   ./scripts/setup_neo4j.sh status   # Check if Neo4j is running
 #   ./scripts/setup_neo4j.sh stop     # Stop the Docker container
 #
-# The script reads FRLM_NEO4J_PASSWORD from the environment (or uses default).
+# The script reads credentials from config/secrets.properties (or uses defaults).
 # =============================================================================
 
 set -euo pipefail
 
-# ── Defaults (match config/default.yaml) ─────────────────────────────────────
+# ── Project root ─────────────────────────────────────────────────────────────
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SECRETS_FILE="${PROJECT_ROOT}/config/secrets.properties"
+
+# ── Helper: read a key from secrets.properties ───────────────────────────────
+read_secret() {
+    local key="$1"
+    local default="${2:-}"
+    if [ -f "$SECRETS_FILE" ]; then
+        local val
+        val=$(grep -E "^${key}=" "$SECRETS_FILE" 2>/dev/null | head -1 | cut -d'=' -f2- | xargs)
+        if [ -n "$val" ]; then
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+# ── Defaults (match config/default.yaml, overridden by secrets.properties) ───
 NEO4J_CONTAINER_NAME="frlm-neo4j"
 NEO4J_VERSION="5.26.0"
 NEO4J_HTTP_PORT=7474
 NEO4J_BOLT_PORT=7687
 NEO4J_DB_NAME="frlm"
-NEO4J_PASSWORD="${FRLM_NEO4J_PASSWORD:-frlm_dev_password}"
-NEO4J_DATA_DIR="$(cd "$(dirname "$0")/.." && pwd)/neo4j_data"
+NEO4J_PASSWORD="$(read_secret 'neo4j.password' 'frlm_dev_password')"
+NEO4J_DATA_DIR="${PROJECT_ROOT}/neo4j_data"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -83,13 +102,11 @@ print_connection_info() {
     echo -e "  Password:     ${CYAN}${NEO4J_PASSWORD}${NC}"
     echo -e "  Database:     ${CYAN}neo4j${NC}  (Community Edition default)"
     echo ""
-    echo -e "  ${YELLOW}Set these in your environment:${NC}"
+    echo -e "  ${YELLOW}Set these in config/secrets.properties:${NC}"
     echo ""
-    echo -e "    export FRLM_NEO4J_PASSWORD=\"${NEO4J_PASSWORD}\""
-    echo ""
-    echo -e "  ${YELLOW}Or add to a .env file:${NC}"
-    echo ""
-    echo -e "    FRLM_NEO4J_PASSWORD=${NEO4J_PASSWORD}"
+    echo -e "    neo4j.uri=bolt://localhost:${NEO4J_BOLT_PORT}"
+    echo -e "    neo4j.username=neo4j"
+    echo -e "    neo4j.password=${NEO4J_PASSWORD}"
     echo ""
     echo -e "  ${YELLOW}Update config/default.yaml if needed:${NC}"
     echo ""

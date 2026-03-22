@@ -15,7 +15,6 @@ from __future__ import annotations
 import gzip
 import hashlib
 import logging
-import os
 import re
 import shutil
 import tarfile
@@ -28,6 +27,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
+
+from config.config import get_secret
 from xml.etree.ElementTree import Element
 
 logger = logging.getLogger(__name__)
@@ -592,7 +593,7 @@ class PMCCorpusLoader:
     ):
         self.corpus_dir = Path(corpus_dir)
         self.cache_dir = Path(cache_dir) if cache_dir else self.corpus_dir / ".cache"
-        self.api_key = api_key or os.environ.get("NCBI_API_KEY")
+        self.api_key = api_key or get_secret("ncbi.api_key")
         self.max_retries = max_retries
         self.retry_delay = retry_delay
 
@@ -967,7 +968,7 @@ def load_corpus_from_config(config: Any) -> PMCCorpusLoader:
     return PMCCorpusLoader(
         corpus_dir=corpus_dir,
         cache_dir=cache_dir,
-        api_key=os.environ.get("NCBI_API_KEY"),
+        api_key=get_secret("ncbi.api_key"),
         max_retries=3,
         retry_delay=2.0,
     )

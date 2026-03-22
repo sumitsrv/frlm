@@ -2,8 +2,9 @@
 FRLM Configuration Loader.
 
 Pydantic models that load, validate, and provide typed access to all
-configuration parameters. Sensitive values (API keys, passwords) are
-overridden by environment variables when present.
+configuration parameters. Sensitive values (API keys, passwords, Neo4j
+URLs and credentials) are read from ``config/secrets.properties`` and
+override the values found in the YAML config file.
 
 Usage:
     from config.config import load_config
@@ -15,7 +16,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -37,6 +37,102 @@ def _resolve_path(p: str) -> Path:
     if path.is_absolute():
         return path
     return _PROJECT_ROOT / path
+
+
+# ---------------------------------------------------------------------------
+# Secrets loader — reads key=value from .properties files
+# ---------------------------------------------------------------------------
+_SECRETS_CACHE: Optional[Dict[str, str]] = None
+
+
+def _load_secrets(
+    secrets_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, str]:
+    """
+    Load secrets from a Java-style ``.properties`` file.
+
+    The file format is simple::
+
+        # comment lines are ignored
+        key=value
+        key = value      # leading/trailing whitespace is stripped
+
+    Parameters
+    ----------
+    secrets_path : str or Path, optional
+        Explicit path to the properties file.  When *None* the loader
+        looks for ``config/secrets.properties`` relative to the project
+        root.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping of property keys to their string values.
+        Returns an empty dict if the file does not exist.
+    """
+    global _SECRETS_CACHE
+    if _SECRETS_CACHE is not None and secrets_path is None:
+        return _SECRETS_CACHE
+
+    if secrets_path is None:
+        secrets_path = _CONFIG_DIR / "secrets.properties"
+    else:
+        secrets_path = Path(secrets_path)
+
+    secrets: Dict[str, str] = {}
+
+    if not secrets_path.exists():
+        logger.debug("Secrets file not found: %s — skipping", secrets_path)
+        _SECRETS_CACHE = secrets
+        return secrets
+
+    logger.info("Loading secrets from %s", secrets_path)
+    with open(secrets_path, "r", encoding="utf-8") as fh:
+        for lineno, raw_line in enumerate(fh, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                logger.warning(
+                    "Ignoring malformed line %d in %s: %r",
+                    lineno,
+                    secrets_path,
+                    line,
+                )
+                continue
+            key, _, value = line.partition("=")
+            secrets[key.strip()] = value.strip()
+
+    _SECRETS_CACHE = secrets
+    return secrets
+
+
+def get_secret(key: str, default: str = "") -> str:
+    """
+    Retrieve a single secret by property key.
+
+    Parameters
+    ----------
+    key : str
+        The property key, e.g. ``"neo4j.password"`` or
+        ``"anthropic.api_key"``.
+    default : str
+        Value to return when the key is not present.
+
+    Returns
+    -------
+    str
+    """
+    return _load_secrets().get(key, default)
+
+
+def reload_secrets(
+    secrets_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, str]:
+    """Force-reload secrets from disk (clears cache)."""
+    global _SECRETS_CACHE
+    _SECRETS_CACHE = None
+    return _load_secrets(secrets_path)
 
 
 # ===========================================================================
@@ -262,11 +358,20 @@ class Neo4jConfig(BaseModel):
     batch: Neo4jBatchConfig = Field(default_factory=Neo4jBatchConfig)
 
     @model_validator(mode="after")
-    def override_password_from_env(self) -> "Neo4jConfig":
-        env_password = os.environ.get("FRLM_NEO4J_PASSWORD")
-        if env_password:
-            self.password = env_password
-            logger.info("Neo4j password overridden from FRLM_NEO4J_PASSWORD env var")
+    def override_from_secrets(self) -> "Neo4jConfig":
+        secrets = _load_secrets()
+        uri = secrets.get("neo4j.uri")
+        if uri:
+            self.uri = uri
+            logger.info("Neo4j URI overridden from secrets.properties")
+        username = secrets.get("neo4j.username")
+        if username:
+            self.username = username
+            logger.info("Neo4j username overridden from secrets.properties")
+        password = secrets.get("neo4j.password")
+        if password:
+            self.password = password
+            logger.info("Neo4j password overridden from secrets.properties")
         return self
 
 
@@ -361,12 +466,12 @@ class RelationExtractionConfig(BaseModel):
     system_prompt: str = ""
 
     @model_validator(mode="after")
-    def override_api_key_from_env(self) -> "RelationExtractionConfig":
-        env_key = os.environ.get("ANTHROPIC_API_KEY")
-        if env_key:
-            self.api_key = env_key
+    def override_api_key_from_secrets(self) -> "RelationExtractionConfig":
+        api_key = get_secret("anthropic.api_key")
+        if api_key:
+            self.api_key = api_key
             logger.info(
-                "Relation extraction API key overridden from ANTHROPIC_API_KEY env var"
+                "Relation extraction API key overridden from secrets.properties"
             )
         return self
 
@@ -430,11 +535,11 @@ class LabelingConfig(BaseModel):
     api_batch_size: int = 50          # texts per API call (1 = legacy, 50 = recommended)
 
     @model_validator(mode="after")
-    def override_api_key_from_env(self) -> "LabelingConfig":
-        env_key = os.environ.get("ANTHROPIC_API_KEY")
-        if env_key:
-            self.api_key = env_key
-            logger.info("Labeling API key overridden from ANTHROPIC_API_KEY env var")
+    def override_api_key_from_secrets(self) -> "LabelingConfig":
+        api_key = get_secret("anthropic.api_key")
+        if api_key:
+            self.api_key = api_key
+            logger.info("Labeling API key overridden from secrets.properties")
         return self
 
 
@@ -705,11 +810,11 @@ class WandBConfig(BaseModel):
     api_key: str = "CHANGE_ME"
 
     @model_validator(mode="after")
-    def override_api_key_from_env(self) -> "WandBConfig":
-        env_key = os.environ.get("WANDB_API_KEY")
-        if env_key:
-            self.api_key = env_key
-            logger.info("WandB API key overridden from WANDB_API_KEY env var")
+    def override_api_key_from_secrets(self) -> "WandBConfig":
+        api_key = get_secret("wandb.api_key")
+        if api_key:
+            self.api_key = api_key
+            logger.info("WandB API key overridden from secrets.properties")
         return self
 
 
@@ -832,7 +937,8 @@ class FRLMConfig(BaseModel):
     Root FRLM configuration.
 
     Aggregates all sub-configurations into a single validated object.
-    Sensitive fields are automatically overridden from environment variables.
+    Sensitive fields are automatically overridden from
+    ``config/secrets.properties``.
     """
 
     project: ProjectConfig = Field(default_factory=ProjectConfig)

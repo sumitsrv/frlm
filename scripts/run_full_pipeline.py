@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import subprocess
 import sys
 import time
@@ -51,7 +50,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config.config import FRLMConfig, load_config, setup_logging
+from config.config import FRLMConfig, get_secret, load_config, setup_logging
 from src.status import PipelineStatusTracker, scan_artifacts_into_status
 
 logger = logging.getLogger(__name__)
@@ -347,7 +346,7 @@ def preflight_checks(
         if neo4j_cfg.password in ("CHANGE_ME", ""):
             errors.append(
                 "Neo4j password is not set. "
-                "Export FRLM_NEO4J_PASSWORD or update config/default.yaml → neo4j.password"
+                "Set neo4j.password in config/secrets.properties or update config/default.yaml"
             )
 
         # 2. Check connectivity + auth
@@ -364,7 +363,7 @@ def preflight_checks(
             except AuthError:
                 errors.append(
                     f"Neo4j authentication failed (uri={neo4j_cfg.uri}, "
-                    f"user={neo4j_cfg.username}). Check FRLM_NEO4J_PASSWORD."
+                    f"user={neo4j_cfg.username}). Check config/secrets.properties."
                 )
             except ServiceUnavailable:
                 errors.append(
@@ -383,21 +382,21 @@ def preflight_checks(
     # -- Steps that need Anthropic API: 3, 6 ---------------------------------
     CLAUDE_STEPS = {3, 6}
     if planned_steps & CLAUDE_STEPS:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", cfg.extraction.relation.api_key)
+        api_key = get_secret("anthropic.api_key", cfg.extraction.relation.api_key)
         if not api_key or api_key in ("CHANGE_ME", ""):
             errors.append(
                 "Anthropic API key is not set. "
-                "Export ANTHROPIC_API_KEY or update config → extraction.relation.api_key"
+                "Set anthropic.api_key in config/secrets.properties"
             )
 
     # -- Steps that need W&B: 7, 8, 9 ----------------------------------------
     WANDB_STEPS = {7, 8, 9}
     if planned_steps & WANDB_STEPS and cfg.wandb.enabled:
-        api_key = os.environ.get("WANDB_API_KEY", cfg.wandb.api_key)
+        api_key = get_secret("wandb.api_key", cfg.wandb.api_key)
         if not api_key or api_key in ("CHANGE_ME", ""):
             errors.append(
                 "W&B API key is not set but wandb.enabled=true. "
-                "Export WANDB_API_KEY, update config, or set wandb.enabled=false"
+                "Set wandb.api_key in config/secrets.properties or set wandb.enabled=false"
             )
 
     return errors

@@ -3,7 +3,7 @@
 # Master Configuration File
 #
 # Every hyperparameter, path, and magic number in the project is defined here.
-# Environment variables override sensitive values (see config.py).
+# Sensitive values (API keys, passwords) are overridden from config/secrets.properties.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -103,7 +103,7 @@ sapbert:
 neo4j:
   uri: "bolt://localhost:7687"
   username: "neo4j"
-  password: "frlm_dev_password"          # override with FRLM_NEO4J_PASSWORD env var
+  password: "frlm_dev_password"          # override via config/secrets.properties
   database: "neo4j"               # Community Edition only supports default "neo4j" DB
   max_connection_pool_size: 50
   connection_timeout: 30         # seconds
@@ -178,7 +178,7 @@ extraction:
   # Relation extraction — Claude API
   relation:
     model: "claude-sonnet-4-6"
-    api_key: "CHANGE_ME"            # override with ANTHROPIC_API_KEY env var
+    api_key: "CHANGE_ME"            # override via config/secrets.properties
     max_tokens: 4096
     temperature: 0.0
     batch_size: 10                  # sentences per API call
@@ -215,7 +215,7 @@ extraction:
 # -----------------------------------------------------------------------------
 labeling:
   model: "claude-haiku-4-5-20251001"   # Haiku: much cheaper for simple labeling tasks
-  api_key: "CHANGE_ME"              # override with ANTHROPIC_API_KEY env var
+  api_key: "CHANGE_ME"              # override via config/secrets.properties
   max_tokens: 4096
   temperature: 0.0
   batch_size: 5                     # chunks per API call
@@ -387,7 +387,7 @@ wandb:
   log_model: true
   log_frequency: 10                 # steps between W&B logs
   watch_model: false                # watch gradients (expensive)
-  api_key: "CHANGE_ME"             # override with WANDB_API_KEY env var
+  api_key: "CHANGE_ME"             # override via config/secrets.properties
 
 # -----------------------------------------------------------------------------
 # Evaluation

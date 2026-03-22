@@ -91,6 +91,7 @@ logs/
 *.pem
 *.key
 credentials.json
+config/secrets.properties
 
 # ===========================================================================
 # Claude Code

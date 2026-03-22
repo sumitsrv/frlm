@@ -4,7 +4,7 @@ Tests for FRLM configuration schema and validation.
 Validates:
 - FRLMConfig loads config/default.yaml correctly
 - Pydantic validators catch invalid values
-- Environment variable overrides work
+- Secrets properties file overrides work
 - Dot-notation overrides work
 - Cross-validation catches mismatched dimensions
 - KG schema models (BiomedicalEntity, Relation, Fact, TemporalEnvelope, FactCluster)
@@ -12,18 +12,16 @@ Validates:
 
 import hashlib
 import json
-import os
 import sys
 from datetime import date
 from pathlib import Path
 from typing import Optional
-from unittest.mock import patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config.config import FRLMConfig, load_config
+from config.config import FRLMConfig, load_config, reload_secrets
 from pydantic import ValidationError
 from src.kg.schema import (
     BiomedicalEntity,
@@ -169,39 +167,60 @@ class TestFieldValidation:
 
 
 # ===========================================================================
-# Environment variable overrides
+# Secrets properties file overrides
 # ===========================================================================
 
 
-class TestEnvironmentOverrides:
-    """Verify sensitive values are overridden from env vars."""
+class TestSecretsPropertiesOverrides:
+    """Verify sensitive values are overridden from config/secrets.properties."""
 
-    def test_neo4j_password_override(self) -> None:
-        with patch.dict(os.environ, {"FRLM_NEO4J_PASSWORD": "secret_123"}):
-            cfg = load_config()
-            assert cfg.neo4j.password == "secret_123"
+    def test_neo4j_password_override(self, tmp_path: Path) -> None:
+        secrets_file = tmp_path / "secrets.properties"
+        secrets_file.write_text("neo4j.password=secret_123\n")
+        reload_secrets(secrets_file)
+        cfg = load_config()
+        assert cfg.neo4j.password == "secret_123"
+        reload_secrets()  # restore default
 
-    def test_neo4j_password_default_without_env(self) -> None:
-        env = os.environ.copy()
-        env.pop("FRLM_NEO4J_PASSWORD", None)
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-            assert cfg.neo4j.password == "frlm_dev_password"
+    def test_neo4j_password_default_without_secrets(self, tmp_path: Path) -> None:
+        secrets_file = tmp_path / "secrets.properties"
+        secrets_file.write_text("# empty\n")
+        reload_secrets(secrets_file)
+        cfg = load_config()
+        assert cfg.neo4j.password == "frlm_dev_password"
+        reload_secrets()  # restore default
 
-    def test_wandb_api_key_override(self) -> None:
-        with patch.dict(os.environ, {"WANDB_API_KEY": "wb_key_xyz"}):
-            cfg = load_config()
-            assert cfg.wandb.api_key == "wb_key_xyz"
+    def test_wandb_api_key_override(self, tmp_path: Path) -> None:
+        secrets_file = tmp_path / "secrets.properties"
+        secrets_file.write_text("wandb.api_key=wb_key_xyz\n")
+        reload_secrets(secrets_file)
+        cfg = load_config()
+        assert cfg.wandb.api_key == "wb_key_xyz"
+        reload_secrets()
 
-    def test_anthropic_api_key_overrides_relation(self) -> None:
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}):
-            cfg = load_config()
-            assert cfg.extraction.relation.api_key == "sk-ant-test"
+    def test_anthropic_api_key_overrides_relation(self, tmp_path: Path) -> None:
+        secrets_file = tmp_path / "secrets.properties"
+        secrets_file.write_text("anthropic.api_key=sk-ant-test\n")
+        reload_secrets(secrets_file)
+        cfg = load_config()
+        assert cfg.extraction.relation.api_key == "sk-ant-test"
+        reload_secrets()
 
-    def test_anthropic_api_key_overrides_labeling(self) -> None:
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-label"}):
-            cfg = load_config()
-            assert cfg.labeling.api_key == "sk-ant-label"
+    def test_anthropic_api_key_overrides_labeling(self, tmp_path: Path) -> None:
+        secrets_file = tmp_path / "secrets.properties"
+        secrets_file.write_text("anthropic.api_key=sk-ant-label\n")
+        reload_secrets(secrets_file)
+        cfg = load_config()
+        assert cfg.labeling.api_key == "sk-ant-label"
+        reload_secrets()
+
+    def test_neo4j_uri_override(self, tmp_path: Path) -> None:
+        secrets_file = tmp_path / "secrets.properties"
+        secrets_file.write_text("neo4j.uri=bolt://remote-host:7687\n")
+        reload_secrets(secrets_file)
+        cfg = load_config()
+        assert cfg.neo4j.uri == "bolt://remote-host:7687"
+        reload_secrets()
 
 
 # ===========================================================================

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -26,6 +25,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator
+
+from config.config import get_secret
 
 if TYPE_CHECKING:
     from config.config import LabelingConfig  # pragma: no cover
@@ -282,7 +283,7 @@ class LLMLabeler:
         tokenizer_name: str = "stanford-crfm/BioMedLM",
     ) -> None:
         self.model = model
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self.api_key = api_key or get_secret("anthropic.api_key", "")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_retries = max_retries

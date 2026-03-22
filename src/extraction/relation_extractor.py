@@ -17,13 +17,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from config.config import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -577,7 +578,7 @@ class RelationExtractor:
         checkpoint_dir: Optional[Path] = None,
     ):
         self.model = model
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        self.api_key = api_key or get_secret("anthropic.api_key")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.max_retries = max_retries
@@ -585,7 +586,8 @@ class RelationExtractor:
 
         if not self.api_key:
             raise ValueError(
-                "Anthropic API key required. Set ANTHROPIC_API_KEY env var or pass api_key."
+                "Anthropic API key required. Set anthropic.api_key in "
+                "config/secrets.properties or pass api_key."
             )
 
         # Initialize client lazily
