@@ -726,7 +726,7 @@ This project is released under the **Creative Commons Attribution-NonCommercial-
 
 If you wish to use FRLM or any derivative for commercial purposes, you **must** obtain a separate commercial license from the original author.
 
-**Contact:** Sumit Srivastava — [sumit-srivastava on GitHub](https://github.com/sumit-srivastava)
+**Contact:** Sumit Srivastava — [sumit-srivastava on GitHub](https://github.com/sumitsrv)
 
 ### Attribution
 
