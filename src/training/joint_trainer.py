@@ -87,6 +87,23 @@ def _build_deepspeed_config(
         micro_batch_size * gradient_accumulation_steps * world_size
     )
 
+    # When running single-GPU, disable CPU optimizer offload.
+    # DeepSpeedCPUAdam requires JIT-compiling a CUDA C++ extension which
+    # fails when the system CUDA toolkit version doesn't exactly match the
+    # version PyTorch was compiled against.  On a single GPU there is no
+    # distributed-memory benefit anyway — FusedAdam on-GPU is faster.
+    if world_size == 1:
+        zero_cfg = ds_dict.get("zero_optimization", {})
+        offload_opt = zero_cfg.get("offload_optimizer", {})
+        if offload_opt.get("device", "none") != "none":
+            logger.info(
+                "Single-GPU run (world_size=1): switching "
+                "offload_optimizer.device from '%s' → 'none' to avoid "
+                "CPUAdam JIT build.",
+                offload_opt["device"],
+            )
+            offload_opt["device"] = "none"
+
     # Optimizer LR / weight decay
     jcfg = config.training.joint
     opt_params = ds_dict.get("optimizer", {}).get("params", {})
@@ -115,6 +132,11 @@ def _init_deepspeed(
 
     Returns (engine, optimizer, _, lr_scheduler).
     """
+    # Allow minor CUDA toolkit version mismatches (e.g. system 12.5 vs
+    # PyTorch-bundled 12.1).  They are ABI-compatible within the same
+    # major version, but DeepSpeed's JIT builder rejects them by default.
+    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
     try:
         import deepspeed
     except ImportError:
