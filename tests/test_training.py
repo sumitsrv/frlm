@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -59,7 +60,7 @@ from src.training.retrieval_trainer import (
     _mean_reciprocal_rank,
     _precision_at_k,
 )
-from src.training.joint_trainer import JointTrainer, _build_deepspeed_config
+from src.training.joint_trainer import JointTrainer, _build_deepspeed_config, _ensure_deepspeed_env
 
 
 # ====================================================================
@@ -903,7 +904,8 @@ class TestRetrievalMetrics:
 class TestBuildDeepSpeedConfig:
     """Tests for DeepSpeed config auto-fill."""
 
-    def test_auto_values_filled(self, default_config: FRLMConfig) -> None:
+    def test_auto_values_filled(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "1")
         ds_dict = _build_deepspeed_config(
             config=default_config,
             micro_batch_size=4,
@@ -915,9 +917,46 @@ class TestBuildDeepSpeedConfig:
         assert ds_dict["train_micro_batch_size_per_gpu"] == 4
         assert ds_dict["gradient_accumulation_steps"] == 8
         assert isinstance(ds_dict["train_batch_size"], int)
-        assert ds_dict["train_batch_size"] >= 4 * 8  # At least 1 GPU
+        # world_size=1 → 4 * 8 * 1 = 32
+        assert ds_dict["train_batch_size"] == 4 * 8 * 1
 
-    def test_optimizer_params_filled(self, default_config: FRLMConfig) -> None:
+    def test_batch_size_scales_with_world_size(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "4")
+        ds_dict = _build_deepspeed_config(
+            config=default_config,
+            micro_batch_size=4,
+            gradient_accumulation_steps=8,
+            total_steps=1000,
+            warmup_steps=100,
+        )
+        assert ds_dict["train_batch_size"] == 4 * 8 * 4
+
+    def test_single_gpu_disables_cpu_offload(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        ds_dict = _build_deepspeed_config(
+            config=default_config,
+            micro_batch_size=4,
+            gradient_accumulation_steps=8,
+            total_steps=1000,
+            warmup_steps=100,
+        )
+        offload_dev = ds_dict["zero_optimization"]["offload_optimizer"]["device"]
+        assert offload_dev == "none"
+
+    def test_multi_gpu_keeps_cpu_offload(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        ds_dict = _build_deepspeed_config(
+            config=default_config,
+            micro_batch_size=4,
+            gradient_accumulation_steps=8,
+            total_steps=1000,
+            warmup_steps=100,
+        )
+        offload_dev = ds_dict["zero_optimization"]["offload_optimizer"]["device"]
+        assert offload_dev == "cpu"
+
+    def test_optimizer_params_filled(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "1")
         ds_dict = _build_deepspeed_config(
             config=default_config,
             micro_batch_size=4,
@@ -931,7 +970,8 @@ class TestBuildDeepSpeedConfig:
         assert isinstance(opt_params["weight_decay"], float)
         assert opt_params["lr"] == default_config.training.joint.learning_rate
 
-    def test_scheduler_params_filled(self, default_config: FRLMConfig) -> None:
+    def test_scheduler_params_filled(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "1")
         ds_dict = _build_deepspeed_config(
             config=default_config,
             micro_batch_size=4,
@@ -945,13 +985,43 @@ class TestBuildDeepSpeedConfig:
         assert sched_params["total_num_steps"] == 1000
         assert sched_params["warmup_max_lr"] == default_config.training.joint.learning_rate
 
-    def test_zero_stage(self, default_config: FRLMConfig) -> None:
+    def test_zero_stage(self, default_config: FRLMConfig, monkeypatch) -> None:
+        monkeypatch.setenv("WORLD_SIZE", "1")
         ds_dict = _build_deepspeed_config(
             config=default_config,
             micro_batch_size=4, gradient_accumulation_steps=8,
             total_steps=1000, warmup_steps=100,
         )
         assert ds_dict["zero_optimization"]["stage"] == 2
+
+    def test_ensure_deepspeed_env_sets_defaults(self, monkeypatch) -> None:
+        """_ensure_deepspeed_env populates single-process defaults."""
+        monkeypatch.delenv("RANK", raising=False)
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+        monkeypatch.delenv("MASTER_ADDR", raising=False)
+        monkeypatch.delenv("MASTER_PORT", raising=False)
+
+        _ensure_deepspeed_env()
+
+        assert os.environ["RANK"] == "0"
+        assert os.environ["LOCAL_RANK"] == "0"
+        assert os.environ["WORLD_SIZE"] == "1"
+        assert os.environ["MASTER_ADDR"] == "localhost"
+        assert os.environ["MASTER_PORT"] == "29500"
+        assert os.environ.get("DS_SKIP_CUDA_CHECK") == "1"
+
+    def test_ensure_deepspeed_env_preserves_existing(self, monkeypatch) -> None:
+        """_ensure_deepspeed_env does not overwrite launcher-provided values."""
+        monkeypatch.setenv("RANK", "3")
+        monkeypatch.setenv("WORLD_SIZE", "8")
+        monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+
+        _ensure_deepspeed_env()
+
+        assert os.environ["RANK"] == "3"
+        assert os.environ["WORLD_SIZE"] == "8"
+        assert os.environ["MASTER_ADDR"] == "10.0.0.1"
 
 
 # ====================================================================

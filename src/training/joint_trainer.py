@@ -60,6 +60,39 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 
 
+def _ensure_deepspeed_env() -> None:
+    """Guarantee the distributed environment variables that DeepSpeed expects.
+
+    Must be called **before** ``_build_deepspeed_config`` (which reads
+    ``WORLD_SIZE``) and ``_init_deepspeed`` (which triggers
+    ``dist.init_distributed``).
+
+    * When a launcher (``deepspeed``, ``torchrun``, ``mpirun``) is used it
+      will have already set ``RANK``, ``LOCAL_RANK``, ``WORLD_SIZE``,
+      ``MASTER_ADDR`` and ``MASTER_PORT`` — this function is a no-op.
+    * When running plain ``python scripts/09_train_joint.py`` (single-GPU),
+      we populate the env with safe single-process defaults so that
+      DeepSpeed initialises NCCL/gloo directly instead of falling back to
+      MPI discovery (which requires ``libmpi.so``).
+    * ``DS_SKIP_CUDA_CHECK=1`` allows minor CUDA toolkit version mismatches
+      (e.g. system 12.5 vs PyTorch-bundled 12.1) that are ABI-compatible
+      within the same major version.
+    """
+    # Bypass strict CUDA version matching in DeepSpeed JIT builder
+    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
+
+    if "RANK" not in os.environ:
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        logger.info(
+            "No distributed launcher detected — set RANK=0, WORLD_SIZE=1 "
+            "to avoid MPI fallback."
+        )
+
+
 def _build_deepspeed_config(
     config: Any,
     micro_batch_size: int,
@@ -70,6 +103,9 @@ def _build_deepspeed_config(
     """Build a DeepSpeed JSON config dict from the FRLM config.
 
     Fills ``"auto"`` placeholders with concrete values.
+
+    .. note:: Call :func:`_ensure_deepspeed_env` before this function so
+       that ``WORLD_SIZE`` is guaranteed to be in ``os.environ``.
     """
     ds_cfg = config.deepspeed.config
 
@@ -131,33 +167,15 @@ def _init_deepspeed(
     """Initialise DeepSpeed engine.
 
     Returns (engine, optimizer, _, lr_scheduler).
-    """
-    # Allow minor CUDA toolkit version mismatches (e.g. system 12.5 vs
-    # PyTorch-bundled 12.1).  They are ABI-compatible within the same
-    # major version, but DeepSpeed's JIT builder rejects them by default.
-    os.environ.setdefault("DS_SKIP_CUDA_CHECK", "1")
 
+    .. note:: Call :func:`_ensure_deepspeed_env` before this function.
+    """
     try:
         import deepspeed
     except ImportError:
         raise ImportError(
             "DeepSpeed is required for Phase 3 joint training. "
             "Install with: pip install deepspeed"
-        )
-
-    # When not using the DeepSpeed/MPI launcher, set the required
-    # distributed environment variables so that DeepSpeed uses
-    # NCCL (or gloo) directly instead of falling back to MPI discovery
-    # (which requires libmpi.so to be installed).
-    if "RANK" not in os.environ:
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("LOCAL_RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "29500")
-        logger.info(
-            "No distributed launcher detected — set RANK=0, WORLD_SIZE=1 "
-            "to avoid MPI fallback."
         )
 
     engine, optimizer, _, lr_scheduler = deepspeed.initialize(
@@ -414,6 +432,7 @@ class JointTrainer:
         # --- DeepSpeed or standard training ---
         use_amp: bool
         if self._use_deepspeed and torch.cuda.is_available():
+            _ensure_deepspeed_env()
             ds_config = _build_deepspeed_config(
                 config=self._cfg,
                 micro_batch_size=self._jcfg.batch_size,
@@ -666,8 +685,10 @@ class JointTrainer:
             fact_emb_expanded = pos_emb.unsqueeze(1).expand(B, seq_len, edim)
             neg_emb_expanded = neg_embs.unsqueeze(1).expand(B, seq_len, n_neg, edim)
 
-            with autocast(enabled=use_amp):
-                output = (self._ds_engine if self._ds_engine else self._model)(
+            # DeepSpeed handles FP16 internally; only use autocast for
+            # standard PyTorch path to avoid double-casting.
+            with autocast(enabled=use_amp and self._ds_engine is None):
+                output = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     router_labels=router_labels,
