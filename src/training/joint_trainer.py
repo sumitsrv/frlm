@@ -121,6 +121,22 @@ def _init_deepspeed(
             "Install with: pip install deepspeed"
         )
 
+    # When not using the DeepSpeed/MPI launcher, set the required
+    # distributed environment variables so that DeepSpeed uses
+    # NCCL (or gloo) directly instead of falling back to MPI discovery
+    # (which requires libmpi.so to be installed).
+    import os
+    if "RANK" not in os.environ:
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        logger.info(
+            "No distributed launcher detected — set RANK=0, WORLD_SIZE=1 "
+            "to avoid MPI fallback."
+        )
+
     engine, optimizer, _, lr_scheduler = deepspeed.initialize(
         model=model,
         config=ds_config,
