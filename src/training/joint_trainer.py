@@ -140,6 +140,22 @@ def _build_deepspeed_config(
             )
             offload_opt["device"] = "none"
 
+        # Shrink communication buffers — there is no cross-GPU traffic on a
+        # single device, so the large default (5e8 ≈ 1 GB in FP16) wastes
+        # VRAM and can cause illegal-memory-access errors when the
+        # allocation silently overflows.
+        _SINGLE_GPU_BUCKET = int(5e7)  # 50 M elements ≈ 100 MB in FP16
+        for buf_key in ("reduce_bucket_size", "allgather_bucket_size"):
+            cur = zero_cfg.get(buf_key, 0)
+            if isinstance(cur, (int, float)) and cur > _SINGLE_GPU_BUCKET:
+                logger.info(
+                    "Single-GPU run: reducing %s from %g → %d",
+                    buf_key, cur, _SINGLE_GPU_BUCKET,
+                )
+                zero_cfg[buf_key] = _SINGLE_GPU_BUCKET
+        # No overlap benefit without actual distributed communication.
+        zero_cfg["overlap_comm"] = False
+
     # Optimizer LR / weight decay
     jcfg = config.training.joint
     opt_params = ds_dict.get("optimizer", {}).get("params", {})
@@ -346,15 +362,26 @@ class JointTrainer:
         self,
         phase1_checkpoint: Optional[Union[str, Path]] = None,
         phase2_checkpoint: Optional[Union[str, Path]] = None,
+        device: Optional[str] = None,
     ) -> None:
-        """Load checkpoints from Phase 1 and/or Phase 2."""
+        """Load checkpoints from Phase 1 and/or Phase 2.
+
+        Parameters
+        ----------
+        device : str, optional
+            Override the map-location for ``torch.load``.  When ``None``
+            the trainer's own ``self._device`` is used.  Pass ``"cpu"``
+            when DeepSpeed will handle device placement later.
+        """
+        load_device = device if device is not None else str(self._device)
+
         if phase1_checkpoint is not None:
             logger.info("Loading Phase 1 router checkpoint: %s", phase1_checkpoint)
             ckpt = CheckpointManager(output_dir=Path(phase1_checkpoint).parent)
             ckpt.load(
                 model=self._model,
                 checkpoint_path=phase1_checkpoint,
-                device=str(self._device),
+                device=load_device,
             )
 
         if phase2_checkpoint is not None:
@@ -363,7 +390,7 @@ class JointTrainer:
             ckpt.load(
                 model=self._model,
                 checkpoint_path=phase2_checkpoint,
-                device=str(self._device),
+                device=load_device,
             )
 
     # ------------------------------------------------------------------
@@ -391,9 +418,23 @@ class JointTrainer:
         """
         t0 = time.time()
 
+        # --- Determine whether DeepSpeed will drive training ---
+        use_ds = self._use_deepspeed and torch.cuda.is_available()
+
         # --- Load prior phases ---
-        self._model.to(self._device)
-        self._load_phase_checkpoints(phase1_checkpoint, phase2_checkpoint)
+        # When DeepSpeed is active, keep the model on CPU during
+        # checkpoint loading so that ``deepspeed.initialize()`` can
+        # manage device placement and FP16 conversion in one pass.
+        # Pre-moving to CUDA and *then* handing to DeepSpeed doubles
+        # peak VRAM (model + FP16 copy + comm buffers) and can cause
+        # ``CUDA error: an illegal memory access was encountered``.
+        if use_ds:
+            self._load_phase_checkpoints(
+                phase1_checkpoint, phase2_checkpoint, device="cpu",
+            )
+        else:
+            self._model.to(self._device)
+            self._load_phase_checkpoints(phase1_checkpoint, phase2_checkpoint)
 
         # --- Configure parameters ---
         self._configure_params()
@@ -444,6 +485,12 @@ class JointTrainer:
                 model=self._model,
                 ds_config=ds_config,
             )
+            # Align self._device with where DeepSpeed actually placed the
+            # model (cuda:<local_rank>) and flush any deferred CUDA errors
+            # from initialisation so they surface here, not at the first
+            # innocent-looking ``.to()`` call inside the training loop.
+            self._device = self._ds_engine.device
+            torch.cuda.synchronize()
             use_amp = False  # DeepSpeed handles FP16 internally
             self._grad_acc = None
             self._scaler = None
@@ -564,6 +611,10 @@ class JointTrainer:
         model = self._ds_engine if self._ds_engine is not None else self._model
         model.train()
 
+        # Resolve the target device — when DeepSpeed is active use the
+        # engine's device to guarantee data lands on the correct GPU.
+        device = self._ds_engine.device if self._ds_engine is not None else self._device
+
         epoch_losses: Dict[str, float] = {}
         n_batches = 0
 
@@ -571,13 +622,13 @@ class JointTrainer:
             self._grad_acc.reset()
 
         for batch in dataloader:
-            input_ids = batch["input_ids"].to(self._device)
-            attention_mask = batch["attention_mask"].to(self._device)
-            router_labels = batch["router_labels"].to(self._device)
-            span_mask = batch["span_mask"].to(self._device)
-            pos_emb = batch["positive_embedding"].to(self._device)
-            neg_embs = batch["negative_embeddings"].to(self._device)
-            token_labels = batch["token_labels"].to(self._device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            router_labels = batch["router_labels"].to(device)
+            span_mask = batch["span_mask"].to(device)
+            pos_emb = batch["positive_embedding"].to(device)
+            neg_embs = batch["negative_embeddings"].to(device)
+            token_labels = batch["token_labels"].to(device)
 
             # Reshape embeddings for the full model forward:
             #   fact_embeddings: (B, seq, emb_dim) — broadcast positive per position
@@ -667,17 +718,20 @@ class JointTrainer:
         model = self._ds_engine if self._ds_engine is not None else self._model
         model.eval()
 
+        # Resolve the target device (same rationale as _train_epoch).
+        device = self._ds_engine.device if self._ds_engine is not None else self._device
+
         epoch_losses: Dict[str, float] = {}
         n_batches = 0
 
         for batch in dataloader:
-            input_ids = batch["input_ids"].to(self._device)
-            attention_mask = batch["attention_mask"].to(self._device)
-            router_labels = batch["router_labels"].to(self._device)
-            span_mask = batch["span_mask"].to(self._device)
-            pos_emb = batch["positive_embedding"].to(self._device)
-            neg_embs = batch["negative_embeddings"].to(self._device)
-            token_labels = batch["token_labels"].to(self._device)
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            router_labels = batch["router_labels"].to(device)
+            span_mask = batch["span_mask"].to(device)
+            pos_emb = batch["positive_embedding"].to(device)
+            neg_embs = batch["negative_embeddings"].to(device)
+            token_labels = batch["token_labels"].to(device)
 
             B, seq_len = input_ids.shape
             edim = pos_emb.size(-1)
