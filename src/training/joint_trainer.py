@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -79,8 +80,9 @@ def _build_deepspeed_config(
     ds_dict["train_micro_batch_size_per_gpu"] = micro_batch_size
     ds_dict["gradient_accumulation_steps"] = gradient_accumulation_steps
 
-    # Calculate train_batch_size
-    world_size = max(torch.cuda.device_count(), 1)
+    # Calculate train_batch_size — use the distributed world size (which
+    # DeepSpeed will validate against), NOT torch.cuda.device_count().
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     ds_dict["train_batch_size"] = (
         micro_batch_size * gradient_accumulation_steps * world_size
     )
@@ -125,7 +127,6 @@ def _init_deepspeed(
     # distributed environment variables so that DeepSpeed uses
     # NCCL (or gloo) directly instead of falling back to MPI discovery
     # (which requires libmpi.so to be installed).
-    import os
     if "RANK" not in os.environ:
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("LOCAL_RANK", "0")
