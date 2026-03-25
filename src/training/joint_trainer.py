@@ -123,7 +123,8 @@ def _build_deepspeed_config(
         micro_batch_size * gradient_accumulation_steps * world_size
     )
 
-    # When running single-GPU, disable CPU optimizer offload.
+    # When running single-GPU, disable CPU optimizer offload and shrink
+    # communication buffers.
     # DeepSpeedCPUAdam requires JIT-compiling a CUDA C++ extension which
     # fails when the system CUDA toolkit version doesn't exactly match the
     # version PyTorch was compiled against.  On a single GPU there is no
@@ -351,7 +352,8 @@ class JointTrainer:
         total = sum(p.numel() for p in self._model.parameters())
         logger.info(
             "Phase 3 params: %.2fM / %.2fM trainable",
-            trainable / 1e6, total / 1e6,
+            trainable / 1e6,
+            total / 1e6,
         )
 
     # ------------------------------------------------------------------
@@ -421,7 +423,6 @@ class JointTrainer:
         # --- Determine whether DeepSpeed will drive training ---
         use_ds = self._use_deepspeed and torch.cuda.is_available()
 
-        # --- Load prior phases ---
         # When DeepSpeed is active, keep the model on CPU during
         # checkpoint loading so that ``deepspeed.initialize()`` can
         # manage device placement and FP16 conversion in one pass.
@@ -472,7 +473,7 @@ class JointTrainer:
 
         # --- DeepSpeed or standard training ---
         use_amp: bool
-        if self._use_deepspeed and torch.cuda.is_available():
+        if use_ds:
             _ensure_deepspeed_env()
             ds_config = _build_deepspeed_config(
                 config=self._cfg,
@@ -485,15 +486,16 @@ class JointTrainer:
                 model=self._model,
                 ds_config=ds_config,
             )
+            use_amp = False  # DeepSpeed handles FP16 internally
+            self._grad_acc = None
+            self._scaler = None
+
             # Align self._device with where DeepSpeed actually placed the
             # model (cuda:<local_rank>) and flush any deferred CUDA errors
             # from initialisation so they surface here, not at the first
             # innocent-looking ``.to()`` call inside the training loop.
             self._device = self._ds_engine.device
             torch.cuda.synchronize()
-            use_amp = False  # DeepSpeed handles FP16 internally
-            self._grad_acc = None
-            self._scaler = None
         else:
             # Standard PyTorch training
             self._optimizer = torch.optim.AdamW(
@@ -599,8 +601,8 @@ class JointTrainer:
             self._jcfg.early_stopping_metric,
             self._state.best_metric,
         )
-        finish_wandb(self._wandb_run)
 
+        finish_wandb(self._wandb_run)
         return best_metrics
 
     # ------------------------------------------------------------------
@@ -704,7 +706,6 @@ class JointTrainer:
 
         # Average epoch losses
         metrics = {k: v / max(n_batches, 1) for k, v in epoch_losses.items()}
-        # Alias for early stopping
         if "total_loss" in metrics:
             metrics["combined_loss"] = metrics["total_loss"]
         return metrics
