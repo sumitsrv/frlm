@@ -764,7 +764,7 @@ class DSSchedulerConfig(BaseModel):
 class ActivationCheckpointingConfig(BaseModel):
     """DeepSpeed activation checkpointing settings."""
 
-    partition_activations: bool = True
+    partition_activations: bool = False
     cpu_checkpointing: bool = False
     contiguous_memory_optimization: bool = False
     number_checkpoints: Optional[int] = None

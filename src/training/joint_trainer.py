@@ -123,23 +123,41 @@ def _build_deepspeed_config(
         micro_batch_size * gradient_accumulation_steps * world_size
     )
 
-    # When running single-GPU, disable CPU optimizer offload and shrink
-    # communication buffers.
-    # DeepSpeedCPUAdam requires JIT-compiling a CUDA C++ extension which
-    # fails when the system CUDA toolkit version doesn't exactly match the
-    # version PyTorch was compiled against.  On a single GPU there is no
-    # distributed-memory benefit anyway — FusedAdam on-GPU is faster.
+    # Single-GPU adjustments: shrink communication buffers and disable
+    # features that are only meaningful for multi-GPU.
     if world_size == 1:
         zero_cfg = ds_dict.get("zero_optimization", {})
+
+        # Keep offload_optimizer on CPU (do NOT switch to "none").
+        # For a 2.7B-param model, optimizer states consume ~22 GB in FP32.
+        # Moving them from CPU → GPU (device="none") would require ~43 GB
+        # of VRAM total, which overflows 40-GB A100s and causes
+        # ``CUDA error: an illegal memory access was encountered``.
+        # CPU offloading keeps only ~11 GB on GPU (FP16 model + grads).
+        # DS_SKIP_CUDA_CHECK=1 (set in _ensure_deepspeed_env) handles
+        # minor CUDA toolkit mismatches for the CPUAdam JIT build.
         offload_opt = zero_cfg.get("offload_optimizer", {})
-        if offload_opt.get("device", "none") != "none":
+        logger.info(
+            "Single-GPU run: keeping offload_optimizer.device='%s' "
+            "to stay within GPU memory budget.",
+            offload_opt.get("device", "none"),
+        )
+
+        # Disable CUDA-pinned memory for the CPU optimizer offload.
+        # With pin_memory=true DeepSpeed calls cudaHostRegister on
+        # ~32 GB of host buffers (FP32 master weights + 2× AdamW
+        # moments for a 2.7B model).  If the OS/driver cannot lock
+        # that much memory the registration fails silently and the
+        # next torch.cuda.synchronize() raises
+        # ``CUDA error: an illegal memory access was encountered``.
+        # Disabling pinning uses ordinary pageable memory — slightly
+        # slower CPU↔GPU copies, but always safe.
+        if offload_opt.get("pin_memory", False):
             logger.info(
-                "Single-GPU run (world_size=1): switching "
-                "offload_optimizer.device from '%s' → 'none' to avoid "
-                "CPUAdam JIT build.",
-                offload_opt["device"],
+                "Single-GPU run: setting offload_optimizer.pin_memory "
+                "= false to avoid large cudaHostRegister allocation."
             )
-            offload_opt["device"] = "none"
+            offload_opt["pin_memory"] = False
 
         # Shrink communication buffers — there is no cross-GPU traffic on a
         # single device, so the large default (5e8 ≈ 1 GB in FP16) wastes
@@ -154,8 +172,34 @@ def _build_deepspeed_config(
                     buf_key, cur, _SINGLE_GPU_BUCKET,
                 )
                 zero_cfg[buf_key] = _SINGLE_GPU_BUCKET
+
         # No overlap benefit without actual distributed communication.
         zero_cfg["overlap_comm"] = False
+
+        # Disable activation partitioning — it is a model-parallelism
+        # feature that tries to split activations across GPUs.  On a
+        # single device it has no effect and can cause CUDA illegal-
+        # memory-access errors during DeepSpeed initialisation.
+        act_ckpt = ds_dict.get("activation_checkpointing", {})
+        if act_ckpt.get("partition_activations", False):
+            logger.info(
+                "Single-GPU run: disabling partition_activations "
+                "(model-parallelism feature, not applicable to 1 device)."
+            )
+            act_ckpt["partition_activations"] = False
+
+    # Remove the activation_checkpointing section entirely when the
+    # backbone already uses HuggingFace gradient checkpointing
+    # (torch.utils.checkpoint).  DeepSpeed's activation_checkpointing
+    # config triggers its own checkpoint-configure path which conflicts
+    # with HuggingFace's hooks and can cause illegal-memory-access
+    # errors during model wrapping.
+    if "activation_checkpointing" in ds_dict:
+        logger.info(
+            "Removing DeepSpeed activation_checkpointing config — "
+            "using HuggingFace native gradient checkpointing instead."
+        )
+        del ds_dict["activation_checkpointing"]
 
     # Optimizer LR / weight decay
     jcfg = config.training.joint
@@ -482,10 +526,35 @@ class JointTrainer:
                 total_steps=total_steps,
                 warmup_steps=warmup_steps,
             )
-            self._ds_engine, self._optimizer, _, self._scheduler = _init_deepspeed(
-                model=self._model,
-                ds_config=ds_config,
-            )
+
+            # Pre-init CUDA sanity check: release any cached memory and
+            # surface stale errors *before* we hand the model to DeepSpeed.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                free_mb = torch.cuda.mem_get_info()[0] / 1e6
+                total_mb = torch.cuda.mem_get_info()[1] / 1e6
+                logger.info(
+                    "Pre-DeepSpeed GPU memory: %.0f MB free / %.0f MB total",
+                    free_mb, total_mb,
+                )
+
+            try:
+                self._ds_engine, self._optimizer, _, self._scheduler = _init_deepspeed(
+                    model=self._model,
+                    ds_config=ds_config,
+                )
+            except Exception as exc:
+                logger.error(
+                    "deepspeed.initialize() failed: %s\n"
+                    "If the error mentions CPUAdam, install DeepSpeed with "
+                    "pre-compiled ops:\n"
+                    "  DS_BUILD_CPU_ADAM=1 pip install deepspeed --force-reinstall\n"
+                    "Or disable DeepSpeed with --no-deepspeed.",
+                    exc,
+                )
+                raise
+
             use_amp = False  # DeepSpeed handles FP16 internally
             self._grad_acc = None
             self._scaler = None
@@ -495,7 +564,23 @@ class JointTrainer:
             # from initialisation so they surface here, not at the first
             # innocent-looking ``.to()`` call inside the training loop.
             self._device = self._ds_engine.device
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError as cuda_err:
+                logger.error(
+                    "CUDA error surfaced during post-init synchronize: %s\n"
+                    "This usually means GPU memory was exhausted during "
+                    "DeepSpeed initialisation.  Possible fixes:\n"
+                    "  1. Ensure offload_optimizer.device is 'cpu' in the "
+                    "DeepSpeed config (saves ~22 GB VRAM for a 2.7B model).\n"
+                    "  2. Reduce batch_size or max_seq_length.\n"
+                    "  3. Run with --no-deepspeed to fall back to standard "
+                    "PyTorch AMP training.\n"
+                    "  4. Set CUDA_LAUNCH_BLOCKING=1 to pinpoint the exact "
+                    "failing kernel.",
+                    cuda_err,
+                )
+                raise
         else:
             # Standard PyTorch training
             self._optimizer = torch.optim.AdamW(

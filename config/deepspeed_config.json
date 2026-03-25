@@ -49,7 +49,7 @@
     },
 
     "activation_checkpointing": {
-        "partition_activations": true,
+        "partition_activations": false,
         "cpu_checkpointing": false,
         "contiguous_memory_optimization": false,
         "number_checkpoints": null,

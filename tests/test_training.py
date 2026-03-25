@@ -931,7 +931,8 @@ class TestBuildDeepSpeedConfig:
         )
         assert ds_dict["train_batch_size"] == 4 * 8 * 4
 
-    def test_single_gpu_disables_cpu_offload(self, default_config: FRLMConfig, monkeypatch) -> None:
+    def test_single_gpu_keeps_cpu_offload(self, default_config: FRLMConfig, monkeypatch) -> None:
+        """Single-GPU run must keep optimizer on CPU to stay within VRAM budget."""
         monkeypatch.setenv("WORLD_SIZE", "1")
         ds_dict = _build_deepspeed_config(
             config=default_config,
@@ -941,7 +942,32 @@ class TestBuildDeepSpeedConfig:
             warmup_steps=100,
         )
         offload_dev = ds_dict["zero_optimization"]["offload_optimizer"]["device"]
-        assert offload_dev == "none"
+        assert offload_dev == "cpu"
+
+    def test_single_gpu_disables_pin_memory(self, default_config: FRLMConfig, monkeypatch) -> None:
+        """Single-GPU run must disable pin_memory to avoid huge cudaHostRegister."""
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        ds_dict = _build_deepspeed_config(
+            config=default_config,
+            micro_batch_size=4,
+            gradient_accumulation_steps=8,
+            total_steps=1000,
+            warmup_steps=100,
+        )
+        pin_mem = ds_dict["zero_optimization"]["offload_optimizer"]["pin_memory"]
+        assert pin_mem is False
+
+    def test_activation_checkpointing_removed(self, default_config: FRLMConfig, monkeypatch) -> None:
+        """activation_checkpointing section must be stripped (HuggingFace handles it)."""
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        ds_dict = _build_deepspeed_config(
+            config=default_config,
+            micro_batch_size=4,
+            gradient_accumulation_steps=8,
+            total_steps=1000,
+            warmup_steps=100,
+        )
+        assert "activation_checkpointing" not in ds_dict
 
     def test_multi_gpu_keeps_cpu_offload(self, default_config: FRLMConfig, monkeypatch) -> None:
         monkeypatch.setenv("WORLD_SIZE", "2")
@@ -1307,7 +1333,7 @@ class TestDeepSpeedConfigJSON:
         path = Path(__file__).resolve().parent.parent / "config" / "deepspeed_config.json"
         with open(path) as f:
             cfg = json.load(f)
-        assert cfg["activation_checkpointing"]["partition_activations"] is True
+        assert cfg["activation_checkpointing"]["partition_activations"] is False
 
 
 # ====================================================================
