@@ -84,6 +84,15 @@ class InfoNCELoss(nn.Module):
         """
         tau = temperature if temperature is not None else self.temperature
 
+        # Compute similarities in FP32 for numerical stability.
+        # Model outputs may be FP16 (DeepSpeed / AMP) while pre-computed
+        # embeddings from the dataset are FP32.  Loss computation should
+        # always run in full precision — this matches what PyTorch's
+        # autocast does internally for cross-entropy and similar ops.
+        query_emb = query_emb.float()
+        positive_emb = positive_emb.float()
+        negative_embs = negative_embs.float()
+
         # Similarities: query · positive  → (batch,)
         pos_sim = (query_emb * positive_emb).sum(dim=-1) / tau  # (batch,)
 

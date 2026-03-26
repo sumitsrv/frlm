@@ -461,6 +461,27 @@ class TestInfoNCELoss:
         loss = loss_fn(q, p, n)
         assert loss.item() > 0
 
+    def test_mixed_dtype_fp16_query_fp32_embeddings(self) -> None:
+        """FP16 query (model output) with FP32 positive/negative (dataset) should work."""
+        loss_fn = self._make_loss()
+        q = torch.randn(BATCH, EMB_DIM, dtype=torch.float16)
+        p = torch.randn(BATCH, EMB_DIM, dtype=torch.float32)
+        n = torch.randn(BATCH, NUM_NEG, EMB_DIM, dtype=torch.float32)
+        loss = loss_fn(q, p, n)
+        assert loss.item() > 0
+        assert torch.isfinite(loss)
+
+    def test_mixed_dtype_gradient_flows(self) -> None:
+        """Gradients should flow correctly through mixed-dtype InfoNCE."""
+        loss_fn = self._make_loss()
+        # FP32 query with grad, FP16 embeddings (reverse direction)
+        q = torch.randn(BATCH, EMB_DIM, requires_grad=True)
+        p = torch.randn(BATCH, EMB_DIM, dtype=torch.float16)
+        n = torch.randn(BATCH, NUM_NEG, EMB_DIM, dtype=torch.float16)
+        loss = loss_fn(q, p, n)
+        loss.backward()
+        assert q.grad is not None
+
 
 # ====================================================================
 # SECTION 6 — RouterLoss
