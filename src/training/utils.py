@@ -36,13 +36,31 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 
 
-def resolve_device(gpu_id: int = 0) -> str:
-    """Return a CUDA device string for *gpu_id* and pin the process to it.
+def _pick_freest_gpu() -> int:
+    """Return the CUDA ordinal of the GPU with the most free memory."""
+    num = torch.cuda.device_count()
+    if num == 0:
+        return 0
+    best_id, best_free = 0, -1
+    for i in range(num):
+        free, _total = torch.cuda.mem_get_info(i)
+        if free > best_free:
+            best_free = free
+            best_id = i
+    return best_id
+
+
+def resolve_device(gpu_id: Optional[int] = None) -> str:
+    """Return a CUDA device string and pin the process to it.
 
     Parameters
     ----------
-    gpu_id : int
-        CUDA device ordinal (0, 1, …).  Use ``-1`` to force CPU.
+    gpu_id : int or None
+        * ``None`` (default) — **auto-select** the GPU with the most
+          free memory.  This is the recommended setting when you have
+          multiple GPUs and want the process to avoid a busy device.
+        * ``0, 1, …`` — use that specific CUDA device.
+        * ``-1`` — force CPU.
 
     Returns
     -------
@@ -54,17 +72,25 @@ def resolve_device(gpu_id: int = 0) -> str:
     * Calls ``torch.cuda.set_device(gpu_id)`` so that *all* subsequent
       default-device allocations (``torch.empty(..., device="cuda")``,
       ``model.cuda()``, etc.) land on the chosen GPU.
-    * Sets ``CUDA_VISIBLE_DEVICES`` in ``os.environ`` so that child
-      processes (e.g. DeepSpeed, dataloader workers) also see only the
-      selected device.
     """
-    if gpu_id < 0 or not torch.cuda.is_available():
-        logger.info("Using CPU (gpu_id=%d, cuda_available=%s)",
-                     gpu_id, torch.cuda.is_available())
+    if not torch.cuda.is_available():
+        logger.info("CUDA not available — using CPU")
+        return "cpu"
+
+    if gpu_id is not None and gpu_id < 0:
+        logger.info("gpu_id=%d requested — using CPU", gpu_id)
         return "cpu"
 
     num_gpus = torch.cuda.device_count()
-    if gpu_id >= num_gpus:
+
+    if gpu_id is None:
+        # Auto-select: pick the GPU with the most free VRAM
+        gpu_id = _pick_freest_gpu()
+        logger.info(
+            "Auto-selected GPU %d (%s) — most free memory out of %d device(s)",
+            gpu_id, torch.cuda.get_device_name(gpu_id), num_gpus,
+        )
+    elif gpu_id >= num_gpus:
         logger.warning(
             "Requested gpu_id=%d but only %d GPU(s) visible — falling "
             "back to GPU 0.",

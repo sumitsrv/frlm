@@ -1080,6 +1080,11 @@ class TestResolveDevice:
     def test_cpu_when_no_cuda(self, _mock_avail) -> None:
         assert resolve_device(0) == "cpu"
 
+    @patch("src.training.utils.torch.cuda.is_available", return_value=False)
+    def test_cpu_when_no_cuda_and_auto(self, _mock_avail) -> None:
+        """Auto-select should fall back to CPU when CUDA is unavailable."""
+        assert resolve_device(None) == "cpu"
+
     @patch("src.training.utils.torch.cuda.is_available", return_value=True)
     @patch("src.training.utils.torch.cuda.device_count", return_value=2)
     @patch("src.training.utils.torch.cuda.set_device")
@@ -1101,8 +1106,29 @@ class TestResolveDevice:
     @patch("src.training.utils.torch.cuda.device_count", return_value=2)
     @patch("src.training.utils.torch.cuda.set_device")
     @patch("src.training.utils.torch.cuda.get_device_name", return_value="FakeGPU")
-    def test_default_gpu_zero(self, _name, _set, _count, _avail) -> None:
-        assert resolve_device() == "cuda:0"
+    @patch("src.training.utils.torch.cuda.mem_get_info")
+    def test_auto_selects_freest_gpu(self, mock_mem, _name, _set, _count, _avail) -> None:
+        """gpu_id=None should pick the GPU with the most free memory."""
+        # GPU 0: 2 GB free, GPU 1: 30 GB free → should pick 1
+        mock_mem.side_effect = lambda i: {
+            0: (2_000_000_000, 40_000_000_000),
+            1: (30_000_000_000, 40_000_000_000),
+        }[i]
+        assert resolve_device(None) == "cuda:1"
+        _set.assert_called_once_with(1)
+
+    @patch("src.training.utils.torch.cuda.is_available", return_value=True)
+    @patch("src.training.utils.torch.cuda.device_count", return_value=2)
+    @patch("src.training.utils.torch.cuda.set_device")
+    @patch("src.training.utils.torch.cuda.get_device_name", return_value="FakeGPU")
+    @patch("src.training.utils.torch.cuda.mem_get_info")
+    def test_auto_selects_gpu0_when_it_has_more_free(self, mock_mem, _name, _set, _count, _avail) -> None:
+        """If GPU 0 has more free memory, auto should still pick it."""
+        mock_mem.side_effect = lambda i: {
+            0: (35_000_000_000, 40_000_000_000),
+            1: (5_000_000_000, 40_000_000_000),
+        }[i]
+        assert resolve_device(None) == "cuda:0"
         _set.assert_called_once_with(0)
 
 

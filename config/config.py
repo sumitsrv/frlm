@@ -647,7 +647,7 @@ class TrainingConfig(BaseModel):
 
     output_dir: str = "checkpoints"
     seed: int = 42
-    gpu_id: int = 0  # which CUDA device to use (0, 1, …); -1 = CPU
+    gpu_id: Optional[int] = None  # null = auto-select freest GPU; 0, 1, … = specific; -1 = CPU
     fp16: bool = True
     bf16: bool = False
     gradient_accumulation_steps: int = 8

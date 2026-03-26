@@ -128,9 +128,9 @@ class TestTrainingConfig:
         assert default_config.training.gradient_accumulation_steps == 8
 
     def test_gpu_id_default(self, default_config: FRLMConfig) -> None:
-        """training.gpu_id should exist and default to 0."""
+        """training.gpu_id should exist and default to None (auto-select)."""
         assert hasattr(default_config.training, "gpu_id")
-        assert default_config.training.gpu_id == 0
+        assert default_config.training.gpu_id is None
 
     def test_max_grad_norm(self, default_config: FRLMConfig) -> None:
         assert default_config.training.max_grad_norm == 1.0
