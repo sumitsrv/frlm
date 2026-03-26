@@ -32,6 +32,55 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
+# GPU device selection
+# ===========================================================================
+
+
+def resolve_device(gpu_id: int = 0) -> str:
+    """Return a CUDA device string for *gpu_id* and pin the process to it.
+
+    Parameters
+    ----------
+    gpu_id : int
+        CUDA device ordinal (0, 1, …).  Use ``-1`` to force CPU.
+
+    Returns
+    -------
+    str
+        ``"cuda:N"`` or ``"cpu"``.
+
+    Side-effects
+    -------------
+    * Calls ``torch.cuda.set_device(gpu_id)`` so that *all* subsequent
+      default-device allocations (``torch.empty(..., device="cuda")``,
+      ``model.cuda()``, etc.) land on the chosen GPU.
+    * Sets ``CUDA_VISIBLE_DEVICES`` in ``os.environ`` so that child
+      processes (e.g. DeepSpeed, dataloader workers) also see only the
+      selected device.
+    """
+    if gpu_id < 0 or not torch.cuda.is_available():
+        logger.info("Using CPU (gpu_id=%d, cuda_available=%s)",
+                     gpu_id, torch.cuda.is_available())
+        return "cpu"
+
+    num_gpus = torch.cuda.device_count()
+    if gpu_id >= num_gpus:
+        logger.warning(
+            "Requested gpu_id=%d but only %d GPU(s) visible — falling "
+            "back to GPU 0.",
+            gpu_id, num_gpus,
+        )
+        gpu_id = 0
+
+    torch.cuda.set_device(gpu_id)
+    logger.info(
+        "Pinned process to GPU %d (%s)",
+        gpu_id, torch.cuda.get_device_name(gpu_id),
+    )
+    return f"cuda:{gpu_id}"
+
+
+# ===========================================================================
 # CheckpointManager
 # ===========================================================================
 

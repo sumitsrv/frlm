@@ -51,6 +51,7 @@ from src.training.utils import (
     TrainingState,
     finish_wandb,
     init_wandb,
+    resolve_device,
 )
 from src.training.dataset import JointDataset, RetrievalDataset, RouterDataset
 from src.training.router_trainer import RouterTrainer, _compute_router_metrics
@@ -1037,6 +1038,20 @@ class TestBuildDeepSpeedConfig:
         assert os.environ["MASTER_PORT"] == "29500"
         assert os.environ.get("DS_SKIP_CUDA_CHECK") == "1"
 
+    def test_ensure_deepspeed_env_with_gpu_id(self, monkeypatch) -> None:
+        """_ensure_deepspeed_env sets LOCAL_RANK to the given gpu_id."""
+        monkeypatch.delenv("RANK", raising=False)
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+        monkeypatch.delenv("MASTER_ADDR", raising=False)
+        monkeypatch.delenv("MASTER_PORT", raising=False)
+
+        _ensure_deepspeed_env(gpu_id=1)
+
+        assert os.environ["RANK"] == "0"
+        assert os.environ["LOCAL_RANK"] == "1"
+        assert os.environ["WORLD_SIZE"] == "1"
+
     def test_ensure_deepspeed_env_preserves_existing(self, monkeypatch) -> None:
         """_ensure_deepspeed_env does not overwrite launcher-provided values."""
         monkeypatch.setenv("RANK", "3")
@@ -1048,6 +1063,47 @@ class TestBuildDeepSpeedConfig:
         assert os.environ["RANK"] == "3"
         assert os.environ["WORLD_SIZE"] == "8"
         assert os.environ["MASTER_ADDR"] == "10.0.0.1"
+
+
+# ====================================================================
+# SECTION 12b — resolve_device
+# ====================================================================
+
+
+class TestResolveDevice:
+    """Tests for GPU device resolution helper."""
+
+    def test_cpu_when_gpu_id_negative(self) -> None:
+        assert resolve_device(-1) == "cpu"
+
+    @patch("src.training.utils.torch.cuda.is_available", return_value=False)
+    def test_cpu_when_no_cuda(self, _mock_avail) -> None:
+        assert resolve_device(0) == "cpu"
+
+    @patch("src.training.utils.torch.cuda.is_available", return_value=True)
+    @patch("src.training.utils.torch.cuda.device_count", return_value=2)
+    @patch("src.training.utils.torch.cuda.set_device")
+    @patch("src.training.utils.torch.cuda.get_device_name", return_value="FakeGPU")
+    def test_selects_requested_gpu(self, _name, _set, _count, _avail) -> None:
+        assert resolve_device(1) == "cuda:1"
+        _set.assert_called_once_with(1)
+
+    @patch("src.training.utils.torch.cuda.is_available", return_value=True)
+    @patch("src.training.utils.torch.cuda.device_count", return_value=1)
+    @patch("src.training.utils.torch.cuda.set_device")
+    @patch("src.training.utils.torch.cuda.get_device_name", return_value="FakeGPU")
+    def test_falls_back_when_gpu_id_exceeds_count(self, _name, _set, _count, _avail) -> None:
+        """Requesting gpu_id=3 with only 1 GPU should fall back to 0."""
+        assert resolve_device(3) == "cuda:0"
+        _set.assert_called_once_with(0)
+
+    @patch("src.training.utils.torch.cuda.is_available", return_value=True)
+    @patch("src.training.utils.torch.cuda.device_count", return_value=2)
+    @patch("src.training.utils.torch.cuda.set_device")
+    @patch("src.training.utils.torch.cuda.get_device_name", return_value="FakeGPU")
+    def test_default_gpu_zero(self, _name, _set, _count, _avail) -> None:
+        assert resolve_device() == "cuda:0"
+        _set.assert_called_once_with(0)
 
 
 # ====================================================================

@@ -33,11 +33,16 @@ from config.config import FRLMConfig, load_config, setup_logging
 from src.model.frlm import FRLMModel
 from src.training.dataset import RouterDataset
 from src.training.router_trainer import RouterTrainer
+from src.training.utils import resolve_device
 
 logger = logging.getLogger(__name__)
 
 
-def train_router(cfg: FRLMConfig, resume_path: str | None = None) -> Dict[str, float]:
+def train_router(
+    cfg: FRLMConfig,
+    resume_path: str | None = None,
+    gpu_id: int | None = None,
+) -> Dict[str, float]:
     """Execute Phase 1: Router head pre-training.
 
     Parameters
@@ -46,6 +51,9 @@ def train_router(cfg: FRLMConfig, resume_path: str | None = None) -> Dict[str, f
         Loaded FRLM configuration.
     resume_path : str, optional
         Checkpoint directory to resume from.
+    gpu_id : int, optional
+        CUDA device ordinal override.  When ``None`` the value from
+        ``cfg.training.gpu_id`` is used.
 
     Returns
     -------
@@ -67,7 +75,8 @@ def train_router(cfg: FRLMConfig, resume_path: str | None = None) -> Dict[str, f
     logger.info("  Early stop:      %s (patience=%d)", router_cfg.early_stopping_metric, router_cfg.early_stopping_patience)
 
     # --- Build model ---
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    effective_gpu = gpu_id if gpu_id is not None else cfg.training.gpu_id
+    device = resolve_device(effective_gpu)
     logger.info("Building FRLM model...")
     model = FRLMModel.from_config(cfg)
 
@@ -138,6 +147,10 @@ def main() -> None:
         "--resume", type=str, default=None,
         help="Path to checkpoint directory to resume training from.",
     )
+    parser.add_argument(
+        "--gpu", type=int, default=None,
+        help="CUDA device ordinal to use (default: None, auto-select GPU).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -145,7 +158,7 @@ def main() -> None:
     logger.info("Starting 07_train_router with config: %s", args.config)
 
     try:
-        train_router(cfg, resume_path=args.resume)
+        train_router(cfg, resume_path=args.resume, gpu_id=args.gpu)
     except KeyboardInterrupt:
         logger.warning("Router training interrupted by user.")
         sys.exit(130)

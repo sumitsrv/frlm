@@ -251,6 +251,7 @@ training:
   # Global settings
   output_dir: "checkpoints"
   seed: 42
+  gpu_id: 0                          # CUDA device index (0, 1, …); set to -1 for CPU
   fp16: true
   bf16: false
   gradient_accumulation_steps: 8

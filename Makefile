@@ -7,8 +7,16 @@ PYTHON      ?= python
 PIP         ?= pip
 PYTEST      ?= pytest
 CONFIG      ?= config/default.yaml
+GPU         ?=
 SHELL       := /bin/bash
 .DEFAULT_GOAL := help
+
+# Build the --gpu flag only when GPU is set (e.g. make train-joint GPU=1)
+ifdef GPU
+  GPU_FLAG := --gpu $(GPU)
+else
+  GPU_FLAG :=
+endif
 
 # ---------------------------------------------------------------------------
 # Environment setup
@@ -87,16 +95,16 @@ data-pipeline: download-corpus extract-entities extract-relations build-kg build
 # ---------------------------------------------------------------------------
 
 .PHONY: train-router
-train-router: ## Phase 1: Train router head
-	$(PYTHON) scripts/07_train_router.py --config $(CONFIG)
+train-router: ## Phase 1: Train router head (use GPU=N to select device)
+	$(PYTHON) scripts/07_train_router.py --config $(CONFIG) $(GPU_FLAG)
 
 .PHONY: train-retrieval
-train-retrieval: ## Phase 2: Train retrieval head
-	$(PYTHON) scripts/08_train_retrieval.py --config $(CONFIG)
+train-retrieval: ## Phase 2: Train retrieval head (use GPU=N to select device)
+	$(PYTHON) scripts/08_train_retrieval.py --config $(CONFIG) $(GPU_FLAG)
 
 .PHONY: train-joint
-train-joint: ## Phase 3: Joint fine-tuning
-	$(PYTHON) scripts/09_train_joint.py --config $(CONFIG)
+train-joint: ## Phase 3: Joint fine-tuning (use GPU=N to select device)
+	$(PYTHON) scripts/09_train_joint.py --config $(CONFIG) $(GPU_FLAG)
 
 .PHONY: train-all
 train-all: train-router train-retrieval train-joint ## Run all three training phases sequentially

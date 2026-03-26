@@ -60,12 +60,18 @@ logger = logging.getLogger(__name__)
 # ===========================================================================
 
 
-def _ensure_deepspeed_env() -> None:
+def _ensure_deepspeed_env(gpu_id: int = 0) -> None:
     """Guarantee the distributed environment variables that DeepSpeed expects.
 
     Must be called **before** ``_build_deepspeed_config`` (which reads
     ``WORLD_SIZE``) and ``_init_deepspeed`` (which triggers
     ``dist.init_distributed``).
+
+    Parameters
+    ----------
+    gpu_id : int
+        CUDA device ordinal to use as ``LOCAL_RANK`` when no distributed
+        launcher is detected.
 
     * When a launcher (``deepspeed``, ``torchrun``, ``mpirun``) is used it
       will have already set ``RANK``, ``LOCAL_RANK``, ``WORLD_SIZE``,
@@ -83,13 +89,14 @@ def _ensure_deepspeed_env() -> None:
 
     if "RANK" not in os.environ:
         os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("LOCAL_RANK", "0")
+        os.environ.setdefault("LOCAL_RANK", str(gpu_id))
         os.environ.setdefault("WORLD_SIZE", "1")
         os.environ.setdefault("MASTER_ADDR", "localhost")
         os.environ.setdefault("MASTER_PORT", "29500")
         logger.info(
-            "No distributed launcher detected — set RANK=0, WORLD_SIZE=1 "
-            "to avoid MPI fallback."
+            "No distributed launcher detected — set RANK=0, LOCAL_RANK=%d, "
+            "WORLD_SIZE=1 to avoid MPI fallback.",
+            gpu_id,
         )
 
 
@@ -518,7 +525,9 @@ class JointTrainer:
         # --- DeepSpeed or standard training ---
         use_amp: bool
         if use_ds:
-            _ensure_deepspeed_env()
+            # Extract the gpu ordinal from the device the user chose
+            _ds_gpu_id = self._device.index if self._device.index is not None else 0
+            _ensure_deepspeed_env(gpu_id=_ds_gpu_id)
             ds_config = _build_deepspeed_config(
                 config=self._cfg,
                 micro_batch_size=self._jcfg.batch_size,

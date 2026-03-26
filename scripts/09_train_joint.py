@@ -36,6 +36,7 @@ from config.config import FRLMConfig, load_config, setup_logging
 from src.model.frlm import FRLMModel
 from src.training.dataset import JointDataset
 from src.training.joint_trainer import JointTrainer
+from src.training.utils import resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ def train_joint(
     phase2_checkpoint: str | None = None,
     resume_path: str | None = None,
     no_deepspeed: bool = False,
+    gpu_id: int | None = None,
 ) -> Dict[str, float]:
     """Execute Phase 3: Joint fine-tuning.
 
@@ -72,6 +74,9 @@ def train_joint(
         Phase 3 checkpoint to resume from.
     no_deepspeed : bool
         Force disable DeepSpeed even if config says enabled.
+    gpu_id : int, optional
+        CUDA device ordinal override.  When ``None`` the value from
+        ``cfg.training.gpu_id`` is used.
 
     Returns
     -------
@@ -113,8 +118,9 @@ def train_joint(
     else:
         logger.warning("No Phase 2 checkpoint found — starting from scratch")
 
-    # --- Build model ---
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # --- Resolve GPU device ---
+    effective_gpu = gpu_id if gpu_id is not None else cfg.training.gpu_id
+    device = resolve_device(effective_gpu)
     logger.info("Building FRLM model...")
     model = FRLMModel.from_config(cfg)
 
@@ -211,6 +217,11 @@ def main() -> None:
         help="Force disable DeepSpeed (use standard PyTorch).",
     )
     parser.add_argument(
+        "--gpu", type=int, default=None,
+        help="CUDA device ordinal to train on (0, 1, …). "
+             "Overrides training.gpu_id in the config. Use -1 for CPU.",
+    )
+    parser.add_argument(
         "--local_rank", type=int, default=-1,
         help="DeepSpeed local rank (set automatically by deepspeed launcher).",
     )
@@ -227,6 +238,7 @@ def main() -> None:
             phase2_checkpoint=args.phase2_ckpt,
             resume_path=args.resume,
             no_deepspeed=args.no_deepspeed,
+            gpu_id=args.gpu,
         )
     except KeyboardInterrupt:
         logger.warning("Joint training interrupted by user.")

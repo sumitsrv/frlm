@@ -22,6 +22,7 @@ from src.training.utils import (
     TrainingState,
     finish_wandb,
     init_wandb,
+    resolve_device,
 )
 
 __all__ = [
@@ -42,4 +43,5 @@ __all__ = [
     "LearningRateScheduler",
     "init_wandb",
     "finish_wandb",
+    "resolve_device",
 ]
