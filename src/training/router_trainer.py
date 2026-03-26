@@ -297,6 +297,9 @@ class RouterTrainer:
             output_dir=ckpt_dir,
             max_checkpoints=self._tcfg.max_checkpoints,
             prefix="router",
+            save_optimizer=self._tcfg.save_optimizer,
+            save_fp16=self._tcfg.save_fp16,
+            save_trainable_only=self._tcfg.save_trainable_only,
         )
 
         # --- Early stopping ---

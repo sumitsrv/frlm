@@ -261,7 +261,10 @@ training:
   log_every_n_steps: 10
   eval_every_n_steps: 500
   save_every_n_steps: 1000
-  max_checkpoints: 5                # keep last N checkpoints
+  max_checkpoints: 2                # keep only best + latest (was 5; each is ~478 MB)
+  save_optimizer: false              # skip optimizer state (~955 MB for 2.7B model); set true if you need to resume mid-epoch
+  save_fp16: true                    # save weights in float16 (~50% smaller; lossless for fp16 training)
+  save_trainable_only: true          # only save params with requires_grad (phase 1: ~1 MB vs 478 MB)
 
   # Phase 1: Router pre-training
   router:

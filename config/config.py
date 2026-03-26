@@ -657,7 +657,10 @@ class TrainingConfig(BaseModel):
     log_every_n_steps: int = 10
     eval_every_n_steps: int = 500
     save_every_n_steps: int = 1000
-    max_checkpoints: int = 5
+    max_checkpoints: int = 2
+    save_optimizer: bool = False  # skip optimizer/scheduler saves to save disk
+    save_fp16: bool = True  # cast to float16 before saving (~50% smaller)
+    save_trainable_only: bool = True  # skip frozen params (huge savings for phase 1/2)
     router: RouterTrainingConfig = Field(default_factory=RouterTrainingConfig)
     retrieval: RetrievalTrainingConfig = Field(default_factory=RetrievalTrainingConfig)
     joint: JointTrainingConfig = Field(default_factory=JointTrainingConfig)

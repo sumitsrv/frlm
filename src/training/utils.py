@@ -152,17 +152,33 @@ class CheckpointManager:
         Maximum number of checkpoints to keep; older ones are deleted.
     prefix : str
         Filename prefix for checkpoint files.
+    save_optimizer : bool
+        Whether to persist optimizer + scheduler state.  Disable to save
+        ~2× model-size of disk (AdamW stores 2 momentum buffers).
+    save_fp16 : bool
+        Cast model weights to ``float16`` before writing.  Halves the
+        ``.pt`` file size with no quality loss when training in FP16.
+    save_trainable_only : bool
+        Only save parameters with ``requires_grad=True``.  In phase 1
+        (backbone frozen, only router head trained) this shrinks a
+        478 MB checkpoint to ~1 MB.
     """
 
     def __init__(
         self,
         output_dir: Union[str, Path],
-        max_checkpoints: int = 5,
+        max_checkpoints: int = 2,
         prefix: str = "checkpoint",
+        save_optimizer: bool = False,
+        save_fp16: bool = True,
+        save_trainable_only: bool = True,
     ) -> None:
         self._output_dir = Path(output_dir)
         self._max_checkpoints = max_checkpoints
         self._prefix = prefix
+        self._save_optimizer = save_optimizer
+        self._save_fp16 = save_fp16
+        self._save_trainable_only = save_trainable_only
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -170,6 +186,24 @@ class CheckpointManager:
         return self._output_dir
 
     # ------------------------------------------------------------------ save
+
+    def _prepare_state_dict(self, model: nn.Module) -> Dict[str, Any]:
+        """Build a (possibly filtered + cast) state dict for saving."""
+        if self._save_trainable_only:
+            sd = {
+                name: param.data
+                for name, param in model.named_parameters()
+                if param.requires_grad
+            }
+        else:
+            sd = model.state_dict()
+
+        if self._save_fp16:
+            sd = {
+                k: v.half() if v.is_floating_point() else v
+                for k, v in sd.items()
+            }
+        return sd
 
     def save(
         self,
@@ -188,26 +222,38 @@ class CheckpointManager:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # Model
-        torch.save(model.state_dict(), ckpt_dir / "model.pt")
+        sd = self._prepare_state_dict(model)
+        torch.save(sd, ckpt_dir / "model.pt")
 
         # Optimizer
-        if optimizer is not None:
+        if self._save_optimizer and optimizer is not None:
             torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
 
         # Scheduler
-        if scheduler is not None:
+        if self._save_optimizer and scheduler is not None:
             torch.save(scheduler.state_dict(), ckpt_dir / "scheduler.pt")
 
-        # Training state + metrics
-        meta: Dict[str, Any] = {"state": state.to_dict()}
+        # Training state + metrics + save flags (needed by load)
+        meta: Dict[str, Any] = {
+            "state": state.to_dict(),
+            "save_flags": {
+                "trainable_only": self._save_trainable_only,
+                "fp16": self._save_fp16,
+            },
+        }
         if metrics:
             meta["metrics"] = metrics
         with open(ckpt_dir / "meta.json", "w") as f:
             json.dump(meta, f, indent=2)
 
+        # Report size
+        model_bytes = (ckpt_dir / "model.pt").stat().st_size
         logger.info(
-            "Checkpoint saved: %s (step=%d, epoch=%d)",
+            "Checkpoint saved: %s (step=%d, epoch=%d, model=%.1f MB%s%s)",
             ckpt_dir.name, state.global_step, state.epoch,
+            model_bytes / 1e6,
+            ", fp16" if self._save_fp16 else "",
+            ", trainable-only" if self._save_trainable_only else "",
         )
 
         self._rotate()
@@ -226,6 +272,9 @@ class CheckpointManager:
         """Load a checkpoint. If *checkpoint_path* is ``None``, loads the
         latest checkpoint in the output directory.
 
+        Handles both full and trainable-only checkpoints transparently.
+        FP16-saved weights are up-cast to FP32 when the model expects it.
+
         Returns the restored :class:`TrainingState`.
         """
         if checkpoint_path is None:
@@ -240,9 +289,29 @@ class CheckpointManager:
 
         logger.info("Loading checkpoint from %s", checkpoint_path)
 
-        model.load_state_dict(
-            torch.load(checkpoint_path / "model.pt", map_location=device)
-        )
+        saved_sd = torch.load(checkpoint_path / "model.pt", map_location=device)
+
+        # Detect whether this is a partial (trainable-only) checkpoint
+        model_sd = model.state_dict()
+        if len(saved_sd) < len(model_sd):
+            # Partial checkpoint — merge into the full state dict
+            logger.info(
+                "Partial checkpoint (%d / %d keys) — merging into model",
+                len(saved_sd), len(model_sd),
+            )
+            for k, v in saved_sd.items():
+                if k in model_sd:
+                    # Up-cast FP16 → FP32 if needed
+                    if v.dtype != model_sd[k].dtype:
+                        v = v.to(model_sd[k].dtype)
+                    model_sd[k] = v
+            model.load_state_dict(model_sd)
+        else:
+            # Full checkpoint — may need dtype up-cast
+            for k in saved_sd:
+                if k in model_sd and saved_sd[k].dtype != model_sd[k].dtype:
+                    saved_sd[k] = saved_sd[k].to(model_sd[k].dtype)
+            model.load_state_dict(saved_sd)
 
         if optimizer is not None and (checkpoint_path / "optimizer.pt").exists():
             optimizer.load_state_dict(

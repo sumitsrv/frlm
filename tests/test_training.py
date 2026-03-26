@@ -229,10 +229,17 @@ class TestCheckpointManager:
 
     def test_save_with_optimizer(self, tmp_dir: Path, tiny_model: nn.Module) -> None:
         optim = torch.optim.SGD(tiny_model.parameters(), lr=0.01)
-        mgr = CheckpointManager(tmp_dir / "ckpts")
+        mgr = CheckpointManager(tmp_dir / "ckpts", save_optimizer=True)
         state = TrainingState(global_step=20)
         path = mgr.save(tiny_model, optim, None, state)
         assert (path / "optimizer.pt").exists()
+
+    def test_save_skips_optimizer_by_default(self, tmp_dir: Path, tiny_model: nn.Module) -> None:
+        optim = torch.optim.SGD(tiny_model.parameters(), lr=0.01)
+        mgr = CheckpointManager(tmp_dir / "ckpts")
+        state = TrainingState(global_step=20)
+        path = mgr.save(tiny_model, optim, None, state)
+        assert not (path / "optimizer.pt").exists()
 
     def test_save_with_metrics(self, tmp_dir: Path, tiny_model: nn.Module) -> None:
         mgr = CheckpointManager(tmp_dir / "ckpts")
@@ -245,7 +252,8 @@ class TestCheckpointManager:
         assert meta["metrics"]["accuracy"] == 0.9
 
     def test_load_restores_model(self, tmp_dir: Path, tiny_model: nn.Module) -> None:
-        mgr = CheckpointManager(tmp_dir / "ckpts")
+        # Use save_fp16=False for exact round-trip
+        mgr = CheckpointManager(tmp_dir / "ckpts", save_fp16=False, save_trainable_only=False)
         state = TrainingState(global_step=40, epoch=2)
         mgr.save(tiny_model, None, None, state)
 
@@ -255,9 +263,66 @@ class TestCheckpointManager:
         assert restored_state.global_step == 40
         assert restored_state.epoch == 2
 
-        # Weights should match
+        # Weights should match exactly
         for p1, p2 in zip(tiny_model.parameters(), new_model.parameters()):
             assert torch.allclose(p1, p2)
+
+    def test_load_fp16_round_trip(self, tmp_dir: Path, tiny_model: nn.Module) -> None:
+        """FP16-saved checkpoint should load back with acceptable precision."""
+        mgr = CheckpointManager(tmp_dir / "ckpts", save_fp16=True)
+        state = TrainingState(global_step=50)
+        mgr.save(tiny_model, None, None, state)
+
+        new_model = nn.Linear(8, 4)
+        mgr.load(new_model)
+        for p1, p2 in zip(tiny_model.parameters(), new_model.parameters()):
+            assert torch.allclose(p1, p2, atol=1e-3)
+
+    def test_save_trainable_only(self, tmp_dir: Path) -> None:
+        """Trainable-only checkpoint should be much smaller than full."""
+        model = nn.Sequential(nn.Linear(64, 64), nn.Linear(64, 64))
+        # Freeze first layer
+        for p in model[0].parameters():
+            p.requires_grad = False
+
+        mgr_full = CheckpointManager(
+            tmp_dir / "full", save_trainable_only=False, save_fp16=False,
+        )
+        mgr_partial = CheckpointManager(
+            tmp_dir / "partial", save_trainable_only=True, save_fp16=False,
+        )
+        state = TrainingState(global_step=1)
+        p_full = mgr_full.save(model, None, None, state)
+        p_partial = mgr_partial.save(model, None, None, state)
+
+        size_full = (p_full / "model.pt").stat().st_size
+        size_partial = (p_partial / "model.pt").stat().st_size
+        assert size_partial < size_full
+
+    def test_load_trainable_only_into_full_model(self, tmp_dir: Path) -> None:
+        """Partial checkpoint should merge correctly into a full model."""
+        model = nn.Sequential(nn.Linear(8, 4), nn.Linear(4, 2))
+        # Freeze first layer, train second
+        for p in model[0].parameters():
+            p.requires_grad = False
+        # Modify trainable layer so we can verify it restores
+        with torch.no_grad():
+            model[1].weight.fill_(0.42)
+
+        mgr = CheckpointManager(
+            tmp_dir / "ckpts", save_trainable_only=True, save_fp16=False,
+        )
+        mgr.save(model, None, None, TrainingState(global_step=1))
+
+        # Load into a fresh model (all random weights)
+        model2 = nn.Sequential(nn.Linear(8, 4), nn.Linear(4, 2))
+        frozen_weights_before = model2[0].weight.clone()
+        mgr.load(model2)
+
+        # Frozen layer should be UNCHANGED (came from model2, not checkpoint)
+        assert torch.equal(model2[0].weight, frozen_weights_before)
+        # Trainable layer should match the saved value
+        assert torch.allclose(model2[1].weight, torch.full_like(model2[1].weight, 0.42))
 
     def test_latest(self, tmp_dir: Path, tiny_model: nn.Module) -> None:
         mgr = CheckpointManager(tmp_dir / "ckpts")
@@ -1488,7 +1553,10 @@ class TestCheckpointIntegration:
             sched.step()
 
         state = TrainingState(epoch=3, global_step=300, best_metric=0.92)
-        mgr = CheckpointManager(tmp_dir / "integration_ckpt")
+        mgr = CheckpointManager(
+            tmp_dir / "integration_ckpt",
+            save_optimizer=True, save_fp16=False, save_trainable_only=False,
+        )
         path = mgr.save(model, optim, sched, state, metrics={"acc": 0.92})
 
         # Restore into new instances
