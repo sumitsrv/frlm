@@ -93,6 +93,14 @@ class GenerationHead(nn.Module):
         Tensor
             Logits with shape ``(..., vocab_size)``.
         """
+        if hidden_states.dtype == torch.float16:
+            # Upcast to FP32 for the large vocabulary projection.
+            # With hidden_dim=2560 and vocab_size=50257, FP16 dot-products
+            # can overflow (max ~65504), producing NaN in cross_entropy.
+            # Gradients are automatically cast back to FP16 by autograd.
+            return torch.nn.functional.linear(
+                hidden_states.float(), self.proj.weight.float(),
+            )
         return self.proj(hidden_states)
 
     # ------------------------------------------------------------------
