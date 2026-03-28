@@ -100,14 +100,14 @@ class TestTrainingConfig:
         assert r.batch_size > 0
         assert r.learning_rate > 0
         assert r.freeze_backbone is True
-        assert r.early_stopping_metric == "f1"
+        assert r.early_stopping_metric == "loss"
 
     def test_retrieval_phase_config(self, default_config: FRLMConfig) -> None:
         r = default_config.training.retrieval
         assert r.epochs > 0
         assert r.contrastive_temperature == 0.07
         assert r.freeze_router is True
-        assert r.early_stopping_metric == "precision_at_1"
+        assert r.early_stopping_metric == "loss"
 
     def test_joint_phase_config(self, default_config: FRLMConfig) -> None:
         j = default_config.training.joint
@@ -121,8 +121,8 @@ class TestTrainingConfig:
         s = default_config.training.splits
         assert abs(s.train + s.validation + s.test - 1.0) < 1e-6
         assert s.train == 0.8
-        assert s.validation == 0.1
-        assert s.test == 0.1
+        assert s.validation == 0.2
+        assert s.test == 0.0
 
     def test_gradient_accumulation(self, default_config: FRLMConfig) -> None:
         assert default_config.training.gradient_accumulation_steps == 8
@@ -136,7 +136,7 @@ class TestTrainingConfig:
         assert default_config.training.max_grad_norm == 1.0
 
     def test_checkpoint_rotation(self, default_config: FRLMConfig) -> None:
-        assert default_config.training.max_checkpoints == 5
+        assert default_config.training.max_checkpoints == 2
 
 
 # ===========================================================================

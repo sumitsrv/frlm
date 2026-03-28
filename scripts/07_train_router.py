@@ -103,7 +103,19 @@ def train_router(
         full_ds, [train_size, val_size], generator=gen,
     )
 
-    logger.info("Data split: train=%d, val=%d", len(train_ds), len(val_ds))
+    # Enable augmentation on training split (val stays clean for stable metrics)
+    full_ds._augment = False  # ensure val subset uses no augmentation
+
+    # Create augmented wrapper for training
+    train_ds_aug = RouterDataset(
+        data_dir=tokenized_dir, max_seq_length=max_seq,
+        augment=True,
+        files=full_ds._files,  # same files
+    )
+    # Apply the same split indices
+    train_ds = torch.utils.data.Subset(train_ds_aug, train_ds.indices)
+
+    logger.info("Data split: train=%d (augmented), val=%d", len(train_ds), len(val_ds))
 
     # --- Create trainer ---
     trainer = RouterTrainer(

@@ -51,6 +51,15 @@ class RouterDataset(Dataset):
         Pad / truncate to this length.
     files : list[Path], optional
         Pre-selected list of files (overrides directory scan).
+    augment : bool
+        If True, apply random augmentations: token masking (replace 10-15%
+        of non-factual tokens with UNK) and random right-truncation
+        (drop up to 20% of tokens from the end). This effectively 2-3×
+        the effective dataset size without API cost.
+    augment_mask_rate : float
+        Fraction of non-factual tokens to mask when augmenting (default 0.12).
+    augment_trunc_rate : float
+        Maximum fraction of tokens to truncate from the right (default 0.20).
     """
 
     def __init__(
@@ -58,9 +67,15 @@ class RouterDataset(Dataset):
         data_dir: Union[str, Path],
         max_seq_length: int = 1024,
         files: Optional[List[Path]] = None,
+        augment: bool = False,
+        augment_mask_rate: float = 0.12,
+        augment_trunc_rate: float = 0.20,
     ) -> None:
         self._data_dir = Path(data_dir)
         self._max_seq_length = max_seq_length
+        self._augment = augment
+        self._augment_mask_rate = augment_mask_rate
+        self._augment_trunc_rate = augment_trunc_rate
 
         if files is not None:
             self._files = list(files)
@@ -71,8 +86,8 @@ class RouterDataset(Dataset):
         self._build_index()
 
         logger.info(
-            "RouterDataset: %d examples from %d files (max_seq=%d)",
-            len(self), len(self._files), max_seq_length,
+            "RouterDataset: %d examples from %d files (max_seq=%d, augment=%s)",
+            len(self), len(self._files), max_seq_length, augment,
         )
 
     # ------------------------------------------------------------------ scan
@@ -129,6 +144,24 @@ class RouterDataset(Dataset):
         input_ids = raw["input_ids"][:seq_len]
         attention_mask = raw.get("attention_mask", [1] * len(input_ids))[:seq_len]
         router_labels = raw["router_labels"][:seq_len]
+
+        # --- Augmentation (training only) ---
+        if self._augment and len(input_ids) > 10:
+            import random
+
+            # 1) Random right-truncation: drop up to augment_trunc_rate of tokens
+            if random.random() < 0.5:
+                min_len = max(10, int(len(input_ids) * (1 - self._augment_trunc_rate)))
+                trunc_len = random.randint(min_len, len(input_ids))
+                input_ids = input_ids[:trunc_len]
+                attention_mask = attention_mask[:trunc_len]
+                router_labels = router_labels[:trunc_len]
+
+            # 2) Random token masking: replace non-factual tokens with 0 (pad/unk)
+            if random.random() < 0.5:
+                for i in range(len(input_ids)):
+                    if router_labels[i] == 0 and random.random() < self._augment_mask_rate:
+                        input_ids[i] = 0  # mask to pad/unk token
 
         # Pad
         pad_len = seq_len - len(input_ids)

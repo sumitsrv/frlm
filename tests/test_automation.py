@@ -438,7 +438,8 @@ class TestRunPipeline:
                 step, "ok", pipeline_mod.StepStatus.COMPLETED
             )
 
-        with patch.object(pipeline_mod, "run_step", side_effect=fake_run_step):
+        with patch.object(pipeline_mod, "preflight_checks", return_value=[]), \
+             patch.object(pipeline_mod, "run_step", side_effect=fake_run_step):
             result = pipeline_mod.run_pipeline(
                 default_config,
                 config_path="config/default.yaml",
@@ -459,7 +460,8 @@ class TestRunPipeline:
                 step, "ok", pipeline_mod.StepStatus.COMPLETED
             )
 
-        with patch.object(pipeline_mod, "run_step", side_effect=fake_run_step):
+        with patch.object(pipeline_mod, "preflight_checks", return_value=[]), \
+             patch.object(pipeline_mod, "run_step", side_effect=fake_run_step):
             result = pipeline_mod.run_pipeline(
                 default_config,
                 config_path="config/default.yaml",

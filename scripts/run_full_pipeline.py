@@ -150,6 +150,18 @@ def _dir_not_empty(directory: Path) -> bool:
     return any(directory.iterdir())
 
 
+def _step7_complete(paths) -> bool:
+    """Step 7 is complete only when tokenized files cover all label files."""
+    tok_dir = paths.resolve("labels_dir") / "tokenized"
+    lab_dir = paths.resolve("labels_dir")
+    if not tok_dir.exists():
+        return False
+    n_tok = len(list(tok_dir.glob("router_PMC*.jsonl")))
+    n_lab = len(list(lab_dir.glob("labels_PMC*.json")))
+    # Complete if at least 90% of label files have been tokenized
+    return n_lab > 0 and n_tok >= n_lab * 0.9
+
+
 def check_step_complete(step: int, cfg: FRLMConfig) -> bool:
     """Heuristic check: does step *step* have output artefacts already?
 
@@ -167,7 +179,7 @@ def check_step_complete(step: int, cfg: FRLMConfig) -> bool:
         ),
         5: lambda: _dir_not_empty(paths.resolve("faiss_index_dir")),
         6: lambda: _dir_not_empty(paths.resolve("labels_dir")),
-        7: lambda: _has_files(paths.resolve("labels_dir") / "tokenized", "*.jsonl"),
+        7: lambda: _step7_complete(paths),
         8: lambda: _dir_not_empty(
             Path(cfg.training.output_dir) / "phase1_router"
         ),

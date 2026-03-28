@@ -296,6 +296,24 @@ def prepare_training_data(
         xml_path = corpus_dir / f"{pmcid}.xml"
         ent_path = processed_dir / f"entities_{pmcid}.json"
 
+        # --- Resume logic: skip already-processed files ---
+        router_jsonl_path = router_out / f"router_{pmcid}.jsonl"
+        retrieval_jsonl_path = retrieval_out / f"retrieval_{pmcid}.jsonl"
+        router_done = router_jsonl_path.exists() and router_jsonl_path.stat().st_size > 0
+        retrieval_done = skip_retrieval or (retrieval_jsonl_path.exists() and retrieval_jsonl_path.stat().st_size > 0)
+
+        if router_done and retrieval_done:
+            logger.info("[%d/%d] Skipping %s (already tokenized)", lf_idx, len(label_files), pmcid)
+            # Count existing examples for accurate totals
+            with open(router_jsonl_path) as f:
+                counts["router_examples"] += sum(1 for _ in f)
+            if retrieval_jsonl_path.exists():
+                with open(retrieval_jsonl_path) as f:
+                    n = sum(1 for _ in f)
+                    counts["retrieval_examples"] += n
+                    counts["joint_examples"] += n
+            continue
+
         if not xml_path.exists():
             logger.warning("Corpus XML not found for %s — skipping", pmcid)
             continue

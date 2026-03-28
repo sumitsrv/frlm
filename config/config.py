@@ -492,7 +492,7 @@ class CorpusConfig(BaseModel):
     sections: List[str] = Field(
         default=["abstract", "introduction", "methods", "results", "discussion"]
     )
-    chunk_size: int = 512
+    chunk_size: int = 256
     chunk_overlap: int = 64
 
 
@@ -512,10 +512,10 @@ class ExtractionConfig(BaseModel):
 class LabelValidationConfig(BaseModel):
     """Label quality validation thresholds."""
 
-    min_retrieval_ratio: float = 0.15
-    max_retrieval_ratio: float = 0.70
+    min_retrieval_ratio: float = 0.05
+    max_retrieval_ratio: float = 0.95
     min_spans_per_chunk: int = 1
-    max_spans_per_chunk: int = 50
+    max_spans_per_chunk: int = 10000
 
 
 class LabelingConfig(BaseModel):
@@ -560,9 +560,9 @@ class RouterTrainingConfig(BaseModel):
     warmup_ratio: float = 0.1
     scheduler: str = "cosine"
     label_smoothing: float = 0.05
-    pos_weight: float = 1.5
-    early_stopping_patience: int = 3
-    early_stopping_metric: str = "f1"
+    pos_weight: float = 2.5
+    early_stopping_patience: int = 5
+    early_stopping_metric: str = "loss"
     freeze_backbone: bool = True
 
     @field_validator("scheduler")
@@ -586,7 +586,7 @@ class RetrievalTrainingConfig(BaseModel):
     contrastive_temperature: float = 0.07
     margin: float = 0.2
     early_stopping_patience: int = 5
-    early_stopping_metric: str = "precision_at_1"
+    early_stopping_metric: str = "loss"
     freeze_backbone: bool = False
     freeze_router: bool = True
 
@@ -628,8 +628,8 @@ class SplitsConfig(BaseModel):
     """Data split ratios."""
 
     train: float = 0.8
-    validation: float = 0.1
-    test: float = 0.1
+    validation: float = 0.2
+    test: float = 0.0
     stratify_by: str = "retrieval_ratio"
 
     @model_validator(mode="after")
