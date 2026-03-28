@@ -169,6 +169,9 @@ def check_step_complete(step: int, cfg: FRLMConfig) -> bool:
     This lets the pipeline skip already-done work on resume.
     """
     paths = cfg.paths
+    # Resolve training output_dir relative to the project root so the
+    # check works regardless of the current working directory.
+    _output_base = paths.resolve("checkpoints_dir")
     checks: Dict[int, Callable[[], bool]] = {
         1: lambda: _has_files(paths.resolve("corpus_dir"), "*.xml"),
         2: lambda: _has_files(paths.resolve("processed_dir"), "entities_*.json"),
@@ -180,15 +183,9 @@ def check_step_complete(step: int, cfg: FRLMConfig) -> bool:
         5: lambda: _dir_not_empty(paths.resolve("faiss_index_dir")),
         6: lambda: _dir_not_empty(paths.resolve("labels_dir")),
         7: lambda: _step7_complete(paths),
-        8: lambda: _dir_not_empty(
-            Path(cfg.training.output_dir) / "phase1_router"
-        ),
-        9: lambda: _dir_not_empty(
-            Path(cfg.training.output_dir) / "phase2_retrieval"
-        ),
-        10: lambda: _dir_not_empty(
-            Path(cfg.training.output_dir) / "phase3_joint"
-        ),
+        8: lambda: _dir_not_empty(_output_base / "phase1_router"),
+        9: lambda: _dir_not_empty(_output_base / "phase2_retrieval"),
+        10: lambda: _dir_not_empty(_output_base / "phase3_joint"),
         11: lambda: _has_files(paths.resolve("export_dir"), "eval_results*"),
         12: lambda: _has_files(paths.resolve("export_dir"), "inference_results*"),
     }

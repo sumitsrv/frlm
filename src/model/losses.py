@@ -161,7 +161,7 @@ class RouterLoss(nn.Module):
         Tensor
             Scalar loss.
         """
-        logits = logits.squeeze(-1)
+        logits = logits.squeeze(-1).float()
         labels = labels.float().squeeze(-1)
 
         # Label smoothing
@@ -249,9 +249,12 @@ class GenerationLoss(nn.Module):
         if (flat_labels == self._ignore_index).all():
             return logits.new_tensor(0.0)
 
+        # Cast to FP32 for numerical stability — FP16 logits over a 50K
+        # vocabulary overflow inside softmax and produce NaN gradients
+        # under DeepSpeed FP16 / AMP.
         vocab_size = logits.size(-1)
         loss = F.cross_entropy(
-            logits.reshape(-1, vocab_size),
+            logits.reshape(-1, vocab_size).float(),
             flat_labels,
             ignore_index=self._ignore_index,
             label_smoothing=self._label_smoothing,

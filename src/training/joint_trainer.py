@@ -721,6 +721,7 @@ class JointTrainer:
 
         epoch_losses: Dict[str, float] = {}
         n_batches = 0
+        nan_batches = 0
 
         if self._grad_acc is not None:
             self._grad_acc.reset()
@@ -756,6 +757,36 @@ class JointTrainer:
                     token_labels=token_labels,
                 )
                 loss = output.total_loss
+
+                # Guard against NaN/Inf losses — skip the batch instead of
+                # feeding bad gradients to DeepSpeed's loss scaler which
+                # cascades down to min_loss_scale and then crashes.
+                if not torch.isfinite(loss):
+                    nan_batches += 1
+                    if nan_batches <= 5 or nan_batches % 20 == 0:
+                        logger.warning(
+                            "NaN/Inf loss at step %d (nan_batches=%d) — "
+                            "skipping batch. Component losses: %s",
+                            self._state.global_step,
+                            nan_batches,
+                            {k: v.item() for k, v in (output.loss_dict or {}).items()},
+                        )
+                    # Build a dummy zero loss that is still connected to the
+                    # model's computation graph so DeepSpeed's backward/step
+                    # (and its internal gradient-accumulation counter + loss
+                    # scaler) remain synchronised.  The zero gradients are
+                    # harmless — effectively a no-op parameter update.
+                    dummy_loss = sum(
+                        p.float().sum() * 0.0
+                        for p in model.parameters()
+                        if p.requires_grad
+                    )
+                    self._ds_engine.backward(dummy_loss)
+                    self._ds_engine.step()
+                    self._state.global_step += 1
+                    self._state.samples_seen += B
+                    continue
+
                 self._ds_engine.backward(loss)
                 self._ds_engine.step()
             else:
@@ -805,6 +836,13 @@ class JointTrainer:
             self._train_logger.log_step(step_metrics, step=self._state.global_step)
 
         self._train_logger.flush(step=self._state.global_step)
+
+        if nan_batches > 0:
+            logger.warning(
+                "Epoch had %d NaN/Inf batches out of %d total — "
+                "effective batches for loss averaging: %d",
+                nan_batches, n_batches + nan_batches, n_batches,
+            )
 
         # Average epoch losses
         metrics = {k: v / max(n_batches, 1) for k, v in epoch_losses.items()}
