@@ -582,10 +582,20 @@ class GradientAccumulator:
         """
         if self.max_grad_norm is not None:
             if scaler is not None:
+                # When backbone is loaded in FP16 with gradient checkpointing,
+                # gradients may be FP16. GradScaler.unscale_ requires FP32.
+                for p in model.parameters():
+                    if p.grad is not None and p.grad.dtype == torch.float16:
+                        p.grad = p.grad.float()
                 scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
 
         if scaler is not None:
+            # Same FP16→FP32 guard when grad clipping was skipped above
+            if self.max_grad_norm is None:
+                for p in model.parameters():
+                    if p.grad is not None and p.grad.dtype == torch.float16:
+                        p.grad = p.grad.float()
             scaler.step(optimizer)
             scaler.update()
         else:
