@@ -605,7 +605,12 @@ class JointTrainer:
                 num_cycles=self._jcfg.num_cycles,
             )
             use_amp = self._tcfg.fp16 and self._device.type == "cuda"
-            self._scaler = GradScaler(enabled=use_amp)
+            # GradScaler requires FP32 master weights; disable it when the
+            # backbone is already loaded in FP16 (autocast still works fine).
+            has_fp16_params = any(
+                p.dtype == torch.float16 for p in self._model.parameters()
+            )
+            self._scaler = GradScaler(enabled=use_amp and not has_fp16_params)
             self._grad_acc = GradientAccumulator(
                 accumulation_steps=self._tcfg.gradient_accumulation_steps,
                 max_grad_norm=self._tcfg.max_grad_norm,
