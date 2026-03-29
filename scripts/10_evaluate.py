@@ -169,6 +169,102 @@ def _build_test_loader(cfg: FRLMConfig) -> Any:
         return None
 
 
+def _build_retrieval_test_loader(cfg: FRLMConfig, faiss_index: Any) -> Any:
+    """Build a retrieval-specific test DataLoader with ground-truth fact IDs.
+
+    Uses the validation split of the RetrievalDataset. For each example,
+    the ``positive_embedding`` is searched against the FAISS index to
+    derive the ground-truth fact ID (nearest neighbour), which is
+    injected as ``ground_truth_fact_ids`` into each batch.
+
+    Returns *None* if retrieval data or FAISS index is unavailable.
+    """
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader, random_split
+
+    if faiss_index is None:
+        logger.warning("FAISS index unavailable — cannot build retrieval test loader")
+        return None
+
+    data_dir = cfg.paths.resolve("processed_dir") / "retrieval"
+    if not data_dir.exists() or not list(data_dir.glob("*.json*")):
+        data_dir = cfg.paths.resolve("processed_dir")
+
+    if not data_dir.exists():
+        logger.warning("Retrieval data not found at %s", data_dir)
+        return None
+
+    try:
+        from src.training.dataset import RetrievalDataset
+
+        emb_dim = cfg.model.retrieval_head.semantic.output_dim
+        num_neg = (
+            cfg.faiss.hard_negatives.num_hard_negatives
+            + cfg.faiss.hard_negatives.num_random_negatives
+        )
+
+        full_ds = RetrievalDataset(
+            data_dir=data_dir,
+            max_seq_length=cfg.model.backbone.max_seq_length,
+            embedding_dim=emb_dim,
+            num_negatives=num_neg,
+        )
+
+        if len(full_ds) == 0:
+            logger.warning("RetrievalDataset is empty — no retrieval test data")
+            return None
+
+        # Use same seed/split as training to get the validation portion
+        val_frac = cfg.training.splits.validation
+        val_size = int(len(full_ds) * val_frac)
+        train_size = len(full_ds) - val_size
+        gen = torch.Generator().manual_seed(cfg.training.seed)
+        _, val_ds = random_split(full_ds, [train_size, val_size], generator=gen)
+
+        logger.info(
+            "Retrieval test dataloader: %d examples (val split from %d total)",
+            len(val_ds), len(full_ds),
+        )
+
+        def _retrieval_collate(batch):
+            """Stack tensors and derive ground_truth_fact_ids from positive embeddings via FAISS."""
+            tensor_keys = [k for k in batch[0].keys() if isinstance(batch[0][k], torch.Tensor)]
+            collated: Dict[str, Any] = {k: torch.stack([b[k] for b in batch]) for k in tensor_keys}
+
+            # Derive LM labels for generation eval compatibility
+            ids = collated["input_ids"].clone()
+            mask = collated["attention_mask"]
+            ids[mask == 0] = -100
+            collated["labels"] = ids
+
+            # Synthesize ground_truth_fact_ids by searching FAISS with each
+            # example's positive_embedding (nearest neighbour = ground truth)
+            gt_fact_ids: List[List[str]] = []
+            for b in batch:
+                pos_emb = b["positive_embedding"].numpy()
+                # Skip zero embeddings (no factual content)
+                if np.linalg.norm(pos_emb) < 1e-6:
+                    gt_fact_ids.append([])
+                    continue
+                results = faiss_index.search(pos_emb, top_k=3)
+                # Use up to 3 nearest facts as ground truth
+                gt_fact_ids.append([fid for fid, _dist in results])
+
+            collated["ground_truth_fact_ids"] = gt_fact_ids
+            return collated
+
+        retrieval_dl = DataLoader(
+            val_ds, batch_size=8, shuffle=False, num_workers=0,
+            collate_fn=_retrieval_collate,
+        )
+        return retrieval_dl
+
+    except Exception as exc:
+        logger.warning("Failed to build retrieval test loader: %s", exc)
+        return None
+
+
 def _load_faiss_index(cfg: FRLMConfig) -> Any:
     """Load the FAISS index."""
     from src.embeddings.faiss_index import FAISSFactIndex
@@ -363,15 +459,22 @@ def evaluate(
     faiss_index = _load_faiss_index(cfg) if (run_retrieval or run_e2e) else None
     kg_client = _load_kg_client(cfg) if (run_retrieval or run_e2e) else None
 
-    # Build test dataloader from available training data
+    # Build test dataloaders from available training data
     test_loader = _build_test_loader(cfg)
+
+    # Build a retrieval-specific test loader with ground_truth_fact_ids
+    # derived from positive embeddings via FAISS nearest-neighbour search.
+    retrieval_test_loader = None
+    if run_retrieval or run_e2e:
+        retrieval_test_loader = _build_retrieval_test_loader(cfg, faiss_index)
 
     all_results: Dict[str, Any] = {}
 
     if run_retrieval:
         logger.info("--- Retrieval Evaluation ---")
         all_results["retrieval"] = _evaluate_retrieval(
-            model, cfg, faiss_index, kg_client, test_loader
+            model, cfg, faiss_index, kg_client,
+            retrieval_test_loader or test_loader,
         )
 
     if run_generation:
@@ -385,7 +488,7 @@ def evaluate(
     if run_e2e:
         logger.info("--- End-to-End Evaluation ---")
         test_loaders: Dict[str, Any] = {
-            "retrieval": test_loader,
+            "retrieval": retrieval_test_loader or test_loader,
             "generation": test_loader,
             "router": test_loader,
         }
