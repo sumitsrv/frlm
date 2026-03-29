@@ -503,6 +503,35 @@ class RetrievalEvaluator:
                 # No retrieval positions in this batch
                 continue
 
+            # Pool per-token outputs → per-sample if the query_signature
+            # has a sequence dimension, i.e. shape (batch, seq_len, dim).
+            # resolve() expects (batch, dim) tensors.
+            if query_sig.semantic_embedding.ndim == 3:
+                # Use attention_mask (or span_mask if available) for pooling
+                pool_mask = batch.get("span_mask")
+                if pool_mask is not None:
+                    pool_mask = pool_mask.to(self.device)
+                    # Fall back to attention_mask if span_mask is all zeros
+                    if pool_mask.sum() == 0:
+                        pool_mask = attention_mask.float()
+                else:
+                    pool_mask = attention_mask.float()
+
+                # Expand mask for broadcasting: (batch, seq_len) → (batch, seq_len, 1)
+                mask_expanded = pool_mask.unsqueeze(-1)
+                denom = mask_expanded.sum(dim=1).clamp(min=1e-8)  # (batch, 1)
+
+                pooled_sem = (query_sig.semantic_embedding * mask_expanded).sum(dim=1) / denom
+                pooled_sem = torch.nn.functional.normalize(pooled_sem, p=2, dim=-1)
+                pooled_gran = (query_sig.granularity_logits * mask_expanded).sum(dim=1) / denom
+                pooled_temp = (query_sig.temporal_logits * mask_expanded).sum(dim=1) / denom
+
+                query_sig = QuerySignature(
+                    semantic_embedding=pooled_sem,
+                    granularity_logits=pooled_gran,
+                    temporal_logits=pooled_temp,
+                )
+
             # Resolve each sample in the batch
             bsz = input_ids.size(0)
             for i in range(bsz):
