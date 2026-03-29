@@ -580,6 +580,7 @@ class RetrievalTrainer:
         all_query: List[Tensor] = []
         all_pos: List[Tensor] = []
         all_neg: List[Tensor] = []
+        nan_batches = 0
         n_batches = 0
 
         self._grad_acc.reset()
@@ -611,6 +612,17 @@ class RetrievalTrainer:
 
                 # InfoNCE loss
                 loss = self._loss_fn(query_emb, pos_emb, neg_embs)
+            # Guard against NaN/Inf — skip batch to avoid corrupting weights
+            if not torch.isfinite(loss):
+                nan_batches += 1
+                if nan_batches <= 5 or nan_batches % 20 == 0:
+                    logger.warning(
+                        "NaN/Inf loss at step %d (nan_batches=%d) — skipping batch.",
+                        self._state.global_step, nan_batches,
+                    )
+                self._optimizer.zero_grad()
+                continue
+
 
             scaled = self._grad_acc.scale_loss(loss)
             self._scaler.scale(scaled).backward()
@@ -643,8 +655,18 @@ class RetrievalTrainer:
             )
 
         self._train_logger.flush(step=self._state.global_step)
+        if nan_batches > 0:
+            logger.warning(
+                "Epoch had %d NaN/Inf batches out of %d total — "
+                "effective batches: %d",
+                nan_batches, n_batches + nan_batches, n_batches,
+            )
 
-        metrics = _compute_retrieval_metrics(all_query, all_pos, all_neg)
+        if n_batches > 0 and all_query:
+            metrics = _compute_retrieval_metrics(all_query, all_pos, all_neg)
+        else:
+            metrics = {"precision_at_1": 0.0, "precision_at_5": 0.0,
+                       "precision_at_10": 0.0, "mrr": 0.0}
         metrics["loss"] = epoch_loss / max(n_batches, 1)
         return metrics
 

@@ -36,9 +36,9 @@ model:
     num_layers: 12
     num_heads: 12
     vocab_size: 50257              # same tokenizer
-    max_seq_length: 512            # shorter for speed
+    max_seq_length: 256            # reduced for 4GB GPU VRAM
     dtype: "float32"               # CPU needs float32
-    gradient_checkpointing: false  # not needed for small model
+    gradient_checkpointing: true   # needed to fit on 4GB GPU with backbone unfrozen
     freeze_backbone: false
     freeze_layers: 0
 
@@ -211,7 +211,7 @@ training:
 
   retrieval:
     epochs: 2
-    batch_size: 4
+    batch_size: 2                  # reduced for 4GB GPU VRAM
     learning_rate: 2.0e-4
     weight_decay: 0.01
     warmup_ratio: 0.1

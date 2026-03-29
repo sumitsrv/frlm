@@ -43,7 +43,7 @@ model:
     num_heads: 32
     vocab_size: 50257
     max_seq_length: 1024
-    dtype: "float16"
+    dtype: "float32"                # FP32 for training — AMP / DeepSpeed handle FP16 casting
     gradient_checkpointing: true
     freeze_backbone: false
     freeze_layers: 0  # number of bottom layers to freeze (0 = none)

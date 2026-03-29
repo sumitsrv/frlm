@@ -484,6 +484,24 @@ class JointTrainer:
             self._load_phase_checkpoints(
                 phase1_checkpoint, phase2_checkpoint, device="cpu",
             )
+
+            # DeepSpeed FP16 expects FP32 model weights so it can maintain
+            # true FP32 master copies and cast to FP16 only for the forward
+            # pass.  If the backbone was loaded in FP16 (dtype="float16"),
+            # the entire forward pass runs in pure FP16 — attention softmax,
+            # LayerNorm, etc. all stay in FP16 without mixed-precision
+            # safety, causing NaN after a few transformer layers.
+            # Upcasting to FP32 on CPU (before deepspeed.initialize) costs
+            # zero extra GPU memory and lets DeepSpeed manage FP16 properly.
+            has_fp16_params = any(
+                p.dtype == torch.float16 for p in self._model.parameters()
+            )
+            if has_fp16_params:
+                logger.info(
+                    "Upcasting model from FP16 → FP32 on CPU before "
+                    "deepspeed.initialize() for proper mixed-precision training."
+                )
+                self._model.float()
         else:
             self._model.to(self._device)
             self._load_phase_checkpoints(phase1_checkpoint, phase2_checkpoint)

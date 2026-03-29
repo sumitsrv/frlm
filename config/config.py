@@ -706,6 +706,12 @@ class DeepSpeedFP16Config(BaseModel):
     min_loss_scale: int = 1
 
 
+class DeepSpeedBF16Config(BaseModel):
+    """DeepSpeed BF16 settings (preferred over FP16 on Ampere+ GPUs)."""
+
+    enabled: bool = False
+
+
 class ZeroOffloadConfig(BaseModel):
     """DeepSpeed ZeRO offload settings."""
 
@@ -784,6 +790,7 @@ class DeepSpeedInnerConfig(BaseModel):
     gradient_accumulation_steps: Union[str, int] = "auto"
     gradient_clipping: float = 1.0
     fp16: DeepSpeedFP16Config = Field(default_factory=DeepSpeedFP16Config)
+    bf16: DeepSpeedBF16Config = Field(default_factory=DeepSpeedBF16Config)
     zero_optimization: ZeroOptimizationConfig = Field(
         default_factory=ZeroOptimizationConfig
     )
